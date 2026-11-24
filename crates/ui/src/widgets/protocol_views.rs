@@ -737,10 +737,10 @@ fn realtime_log_ui(ui: &mut Ui, id: &str, entries: &mut Vec<RealtimeLogEntry>) {
     ScrollArea::vertical().id_salt(id).stick_to_bottom(true).show(ui, |ui| {
         for entry in entries.iter() {
             let (arrow, color) = match entry.direction {
-                LogDirection::Sent => ("↑", Color32::from_rgb(251, 191, 36)),
-                LogDirection::Received => ("↓", Color32::from_rgb(52, 211, 153)),
-                LogDirection::System => ("•", Color32::from_rgb(96, 165, 250)),
-                LogDirection::Error => ("✕", Color32::from_rgb(248, 113, 113)),
+                LogDirection::Sent => ("TX ->", Color32::from_rgb(251, 191, 36)),
+                LogDirection::Received => ("RX <-", Color32::from_rgb(52, 211, 153)),
+                LogDirection::System => ("SYS", Color32::from_rgb(96, 165, 250)),
+                LogDirection::Error => ("ERR", Color32::from_rgb(248, 113, 113)),
             };
             ui.horizontal_wrapped(|ui| {
                 ui.weak(entry.timestamp.format("%H:%M:%S").to_string());

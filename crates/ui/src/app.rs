@@ -488,25 +488,13 @@ impl ApiTesterApp {
                 vars.local = out.updated_local_vars;
             }
 
-            // 2. Resolve auth inheritance + apply auth
+            // 2. Resolve auth inheritance + variable interpolation + apply auth
             let resolver = VariableResolver::new(vars.clone());
             let effective_auth = resolve_auth(&[&req.auth, &parent_auth]);
-            let auth_ctx = AuthRequestContext {
-                method: req.method.as_str().to_string(),
-                url: resolver.resolve(&req.url),
-                headers: req
-                    .headers
-                    .iter()
-                    .filter(|h| h.enabled)
-                    .map(|h| (resolver.resolve(&h.key), resolver.resolve(&h.value)))
-                    .collect(),
-                body: match &req.body {
-                    RequestBody::Raw { content, .. } => resolver.resolve(content).into_bytes(),
-                    _ => Vec::new(),
-                },
-            };
+            let resolved_auth = resolve_auth_variables(effective_auth, &resolver);
+            let auth_ctx = build_auth_context(&req, &resolver);
 
-            let auth_app = match apply_auth(effective_auth, &auth_ctx) {
+            let auth_app = match apply_auth(&resolved_auth, &auth_ctx) {
                 Ok(a) => a,
                 Err(e) => {
                     let _ = tx.send(UiMessage::HttpFinished {
@@ -614,7 +602,7 @@ impl ApiTesterApp {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui
-                    .button(if self.sidebar_open { "◧" } else { "☰" })
+                    .button(if self.sidebar_open { "<<" } else { ">>" })
                     .on_hover_text("Toggle Sidebar")
                     .clicked()
                 {
@@ -695,7 +683,7 @@ impl ApiTesterApp {
                 }
 
                 let proxy_label = if self.proxy_server.is_some() {
-                    RichText::new("● Proxy ON").color(Color32::from_rgb(52, 211, 153))
+                    RichText::new("Proxy ON").color(Color32::from_rgb(52, 211, 153))
                 } else {
                     RichText::new("Proxy")
                 };
@@ -704,12 +692,12 @@ impl ApiTesterApp {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⚙").on_hover_text("Settings").clicked() {
+                    if ui.button("Settings").on_hover_text("Settings").clicked() {
                         self.modal = ModalState::Settings;
                     }
                     let theme_icon = match self.settings.theme {
-                        ThemeMode::Light => "🌙",
-                        _ => "☀",
+                        ThemeMode::Light => "Dark",
+                        _ => "Light",
                     };
                     if ui
                         .button(theme_icon)
@@ -882,7 +870,7 @@ impl ApiTesterApp {
             for (idx, env) in self.environments.iter_mut().enumerate() {
                 let is_active = self.settings.active_environment_id == Some(env.id);
                 let label = if is_active {
-                    format!("● {}", env.name)
+                    format!("* {}", env.name)
                 } else {
                     env.name.clone()
                 };
@@ -983,7 +971,7 @@ impl ApiTesterApp {
                 ui.horizontal(|ui| {
                     ui.strong(&c.domain);
                     ui.label(format!("{}={}", c.name, c.value));
-                    if ui.small_button("×").clicked() {
+                    if ui.small_button("x").clicked() {
                         del_cookie = Some(idx);
                     }
                 });
@@ -999,9 +987,9 @@ impl ApiTesterApp {
     fn render_console_drawer(&mut self, ctx: &egui::Context) {
         TopBottomPanel::bottom("console_drawer").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                let arrow = if self.console_open { "▼" } else { "▲" };
+                let arrow = if self.console_open { "v" } else { "^" };
                 if ui
-                    .small_button(format!("{arrow} Wire Console ({})", self.console_logs.len()))
+                    .small_button(format!("[{arrow}] Wire Console ({})", self.console_logs.len()))
                     .clicked()
                 {
                     self.console_open = !self.console_open;
@@ -1051,12 +1039,12 @@ impl ApiTesterApp {
                         ProtocolConfig::Mcp { .. } => "MCP",
                         ProtocolConfig::Sse { .. } => "SSE",
                     };
-                    let dirty_mark = if tab.dirty { " •" } else { "" };
+                    let dirty_mark = if tab.dirty { " *" } else { "" };
                     let label = format!("{badge} {}{dirty_mark}", tab.title);
                     if ui.selectable_label(selected, label).clicked() {
                         self.active_tab = idx;
                     }
-                    if ui.small_button("×").clicked() {
+                    if ui.small_button("x").clicked() {
                         close_idx = Some(idx);
                     }
                     ui.separator();
@@ -1767,6 +1755,194 @@ fn pretty_format_body(raw: &str) -> String {
     raw.to_string()
 }
 
+fn build_auth_context(req: &RequestItem, resolver: &VariableResolver) -> AuthRequestContext {
+    let mut url = resolver.resolve(&req.url);
+    let enabled_params: Vec<String> = req
+        .params
+        .iter()
+        .filter(|kv| kv.enabled && !kv.key.is_empty())
+        .map(|kv| {
+            format!(
+                "{}={}",
+                resolver.resolve(&kv.key),
+                resolver.resolve(&kv.value)
+            )
+        })
+        .collect();
+    if !enabled_params.is_empty() && !url.contains('?') {
+        url.push('?');
+        url.push_str(&enabled_params.join("&"));
+    } else if !enabled_params.is_empty() {
+        // Only append params not already embedded in the URL query string.
+        let existing_query = url
+            .split_once('?')
+            .map(|(_, q)| q.to_string())
+            .unwrap_or_default();
+        for p in enabled_params {
+            if !existing_query.split('&').any(|part| part == p) {
+                url.push('&');
+                url.push_str(&p);
+            }
+        }
+    }
+
+    let body = match &req.body {
+        RequestBody::Raw { content, .. } => resolver.resolve(content).into_bytes(),
+        RequestBody::UrlEncoded(fields) => fields
+            .iter()
+            .filter(|kv| kv.enabled && !kv.key.is_empty())
+            .map(|kv| format!("{}={}", resolver.resolve(&kv.key), resolver.resolve(&kv.value)))
+            .collect::<Vec<_>>()
+            .join("&")
+            .into_bytes(),
+        RequestBody::GraphQL { query, variables } => {
+            let vars_json: serde_json::Value =
+                serde_json::from_str(&resolver.resolve(variables)).unwrap_or_else(|_| serde_json::json!({}));
+            serde_json::json!({
+                "query": resolver.resolve(query),
+                "variables": vars_json,
+            })
+            .to_string()
+            .into_bytes()
+        }
+        _ => Vec::new(),
+    };
+
+    AuthRequestContext {
+        method: req.method.as_str().to_string(),
+        url,
+        headers: req
+            .headers
+            .iter()
+            .filter(|h| h.enabled)
+            .map(|h| (resolver.resolve(&h.key), resolver.resolve(&h.value)))
+            .collect(),
+        body,
+    }
+}
+
+fn resolve_auth_variables(auth: &AuthConfig, resolver: &VariableResolver) -> AuthConfig {
+    let r = |s: &str| resolver.resolve(s);
+    let ro = |o: &Option<String>| o.as_deref().map(|s| resolver.resolve(s));
+    match auth {
+        AuthConfig::Inherit => AuthConfig::Inherit,
+        AuthConfig::NoAuth => AuthConfig::NoAuth,
+        AuthConfig::Bearer { token } => AuthConfig::Bearer { token: r(token) },
+        AuthConfig::Basic { username, password } => AuthConfig::Basic {
+            username: r(username),
+            password: r(password),
+        },
+        AuthConfig::ApiKey { key, value, add_to } => AuthConfig::ApiKey {
+            key: r(key),
+            value: r(value),
+            add_to: *add_to,
+        },
+        AuthConfig::OAuth2(c) => {
+            let mut out = c.clone();
+            out.access_token = r(&c.access_token);
+            out.refresh_token = ro(&c.refresh_token);
+            out.token_type = r(&c.token_type);
+            out.header_prefix = r(&c.header_prefix);
+            out.auth_url = r(&c.auth_url);
+            out.token_url = r(&c.token_url);
+            out.redirect_uri = r(&c.redirect_uri);
+            out.client_id = r(&c.client_id);
+            out.client_secret = r(&c.client_secret);
+            out.scope = r(&c.scope);
+            out.state = r(&c.state);
+            AuthConfig::OAuth2(out)
+        }
+        AuthConfig::AwsV4(c) => {
+            let mut out = c.clone();
+            out.access_key = r(&c.access_key);
+            out.secret_key = r(&c.secret_key);
+            out.region = r(&c.region);
+            out.service = r(&c.service);
+            out.session_token = ro(&c.session_token);
+            AuthConfig::AwsV4(out)
+        }
+        AuthConfig::Jwt(c) => {
+            let mut out = c.clone();
+            out.algorithm = r(&c.algorithm);
+            out.secret = r(&c.secret);
+            out.payload = r(&c.payload);
+            out.header_prefix = r(&c.header_prefix);
+            out.query_param_key = r(&c.query_param_key);
+            out.custom_headers = ro(&c.custom_headers);
+            AuthConfig::Jwt(out)
+        }
+        AuthConfig::Digest(c) => {
+            let mut out = c.clone();
+            out.username = r(&c.username);
+            out.password = r(&c.password);
+            out.realm = r(&c.realm);
+            out.nonce = r(&c.nonce);
+            out.algorithm = r(&c.algorithm);
+            out.qop = r(&c.qop);
+            out.nonce_count = r(&c.nonce_count);
+            out.client_nonce = r(&c.client_nonce);
+            out.opaque = r(&c.opaque);
+            AuthConfig::Digest(out)
+        }
+        AuthConfig::OAuth1(c) => {
+            let mut out = c.clone();
+            out.consumer_key = r(&c.consumer_key);
+            out.consumer_secret = r(&c.consumer_secret);
+            out.token = r(&c.token);
+            out.token_secret = r(&c.token_secret);
+            out.signature_method = r(&c.signature_method);
+            out.timestamp = ro(&c.timestamp);
+            out.nonce = ro(&c.nonce);
+            out.version = r(&c.version);
+            out.realm = ro(&c.realm);
+            AuthConfig::OAuth1(out)
+        }
+        AuthConfig::Ntlm(c) => {
+            let mut out = c.clone();
+            out.username = r(&c.username);
+            out.password = r(&c.password);
+            out.domain = r(&c.domain);
+            out.workstation = r(&c.workstation);
+            AuthConfig::Ntlm(out)
+        }
+        AuthConfig::Hawk(c) => {
+            let mut out = c.clone();
+            out.auth_id = r(&c.auth_id);
+            out.auth_key = r(&c.auth_key);
+            out.algorithm = r(&c.algorithm);
+            out.user = r(&c.user);
+            out.nonce = r(&c.nonce);
+            out.extra_data = r(&c.extra_data);
+            out.app = r(&c.app);
+            out.delegation = r(&c.delegation);
+            out.timestamp = ro(&c.timestamp);
+            AuthConfig::Hawk(out)
+        }
+        AuthConfig::EdgeGrid(c) => {
+            let mut out = c.clone();
+            out.access_token = r(&c.access_token);
+            out.client_token = r(&c.client_token);
+            out.client_secret = r(&c.client_secret);
+            out.nonce = r(&c.nonce);
+            out.timestamp = ro(&c.timestamp);
+            out.base_url = r(&c.base_url);
+            out.headers_to_sign = r(&c.headers_to_sign);
+            AuthConfig::EdgeGrid(out)
+        }
+        AuthConfig::Asap(c) => {
+            let mut out = c.clone();
+            out.alg = r(&c.alg);
+            out.issuer = r(&c.issuer);
+            out.kid = r(&c.kid);
+            out.audience = r(&c.audience);
+            out.subject = r(&c.subject);
+            out.private_key = r(&c.private_key);
+            out.claims = r(&c.claims);
+            AuthConfig::Asap(out)
+        }
+    }
+}
+
 fn format_bytes(bytes: usize) -> String {
     if bytes >= 1_048_576 {
         format!("{:.2} MB", bytes as f64 / 1_048_576.0)
@@ -1884,5 +2060,29 @@ mod tests {
                 "missing URL in {lang:?}: {snippet}"
             );
         }
+    }
+
+    #[test]
+    fn auth_variables_and_query_params_resolved_before_apply_auth() {
+        let mut vars = VariableContext::new();
+        vars.set(VariableScope::Environment, "baseUrl", "https://api.test");
+        vars.set(VariableScope::Environment, "authToken", "secret_tok_42");
+        let resolver = VariableResolver::new(vars);
+
+        let mut req = RequestItem::new("Users", HttpMethod::Get, "{{baseUrl}}/users");
+        req.params.push(KeyValue::new("limit", "10"));
+        let auth = AuthConfig::Bearer {
+            token: "{{authToken}}".into(),
+        };
+
+        let resolved_auth = resolve_auth_variables(&auth, &resolver);
+        let auth_ctx = build_auth_context(&req, &resolver);
+        assert_eq!(auth_ctx.url, "https://api.test/users?limit=10");
+
+        let applied = apply_auth(&resolved_auth, &auth_ctx).unwrap();
+        assert_eq!(
+            applied.headers,
+            vec![("Authorization".to_string(), "Bearer secret_tok_42".to_string())]
+        );
     }
 }

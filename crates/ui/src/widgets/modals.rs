@@ -489,7 +489,7 @@ fn render_collection_runner_tab(ui: &mut egui::Ui, app: &mut ApiTesterApp) {
             if ui
                 .add_enabled(
                     !app.runner_in_flight,
-                    egui::Button::new(format!("▶ Run '{}'", col.name)),
+                    egui::Button::new(format!("Run '{}'", col.name)),
                 )
                 .clicked()
             {
@@ -623,7 +623,7 @@ fn render_load_tester_tab(ui: &mut egui::Ui, app: &mut ApiTesterApp) {
 
         if app.load_in_flight {
             if ui
-                .button(RichText::new("■ Stop").color(Color32::from_rgb(248, 113, 113)))
+                .button(RichText::new("Stop").color(Color32::from_rgb(248, 113, 113)))
                 .clicked()
             {
                 if let Some(flag) = &app.load_cancel {
@@ -633,7 +633,7 @@ fn render_load_tester_tab(ui: &mut egui::Ui, app: &mut ApiTesterApp) {
             ui.spinner();
         } else if ui
             .button(
-                RichText::new("▶ Start Load Test")
+                RichText::new("Start Load Test")
                     .strong()
                     .color(Color32::from_rgb(255, 108, 55)),
             )

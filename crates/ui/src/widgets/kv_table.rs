@@ -9,7 +9,7 @@ pub fn kv_table_ui(ui: &mut Ui, id_salt: &str, items: &mut Vec<KeyValue>) -> boo
     Grid::new(id_salt)
         .num_columns(5)
         .striped(true)
-        .min_col_width(24.0)
+        .spacing([8.0, 6.0])
         .show(ui, |ui| {
             ui.strong("On");
             ui.strong("Key");
@@ -21,15 +21,15 @@ pub fn kv_table_ui(ui: &mut Ui, id_salt: &str, items: &mut Vec<KeyValue>) -> boo
             for (idx, item) in items.iter_mut().enumerate() {
                 changed |= ui.checkbox(&mut item.enabled, "").changed();
                 changed |= ui
-                    .add(egui::TextEdit::singleline(&mut item.key).desired_width(160.0))
+                    .add_sized([180.0, 22.0], egui::TextEdit::singleline(&mut item.key))
                     .changed();
                 changed |= ui
-                    .add(egui::TextEdit::singleline(&mut item.value).desired_width(240.0))
+                    .add_sized([240.0, 22.0], egui::TextEdit::singleline(&mut item.value))
                     .changed();
                 changed |= ui
-                    .add(egui::TextEdit::singleline(&mut item.description).desired_width(160.0))
+                    .add_sized([200.0, 22.0], egui::TextEdit::singleline(&mut item.description))
                     .changed();
-                if ui.small_button("×").on_hover_text("Remove row").clicked() {
+                if ui.small_button("x").on_hover_text("Remove row").clicked() {
                     remove_idx = Some(idx);
                 }
                 ui.end_row();
@@ -68,7 +68,7 @@ pub fn form_data_table_ui(ui: &mut Ui, id_salt: &str, items: &mut Vec<FormField>
             for (idx, field) in items.iter_mut().enumerate() {
                 changed |= ui.checkbox(&mut field.enabled, "").changed();
                 changed |= ui
-                    .add(egui::TextEdit::singleline(&mut field.key).desired_width(150.0))
+                    .add_sized([160.0, 22.0], egui::TextEdit::singleline(&mut field.key))
                     .changed();
 
                 let is_file = matches!(field.kind, FormFieldKind::File { .. });
@@ -97,21 +97,20 @@ pub fn form_data_table_ui(ui: &mut Ui, id_salt: &str, items: &mut Vec<FormField>
                 match &mut field.kind {
                     FormFieldKind::Text { value } => {
                         changed |= ui
-                            .add(egui::TextEdit::singleline(value).desired_width(260.0))
+                            .add_sized([260.0, 22.0], egui::TextEdit::singleline(value))
                             .changed();
                     }
                     FormFieldKind::File { path, .. } => {
                         changed |= ui
-                            .add(
-                                egui::TextEdit::singleline(path)
-                                    .hint_text("/path/to/file")
-                                    .desired_width(260.0),
+                            .add_sized(
+                                [260.0, 22.0],
+                                egui::TextEdit::singleline(path).hint_text("/path/to/file"),
                             )
                             .changed();
                     }
                 }
 
-                if ui.small_button("×").clicked() {
+                if ui.small_button("x").clicked() {
                     remove_idx = Some(idx);
                 }
                 ui.end_row();
@@ -155,17 +154,17 @@ pub fn variables_table_ui(
             for (idx, var) in vars.iter_mut().enumerate() {
                 changed |= ui.checkbox(&mut var.enabled, "").changed();
                 changed |= ui
-                    .add(egui::TextEdit::singleline(&mut var.key).desired_width(130.0))
+                    .add_sized([140.0, 22.0], egui::TextEdit::singleline(&mut var.key))
                     .changed();
                 changed |= ui
-                    .add(
+                    .add_sized(
+                        [180.0, 22.0],
                         egui::TextEdit::singleline(&mut var.value)
-                            .password(var.secret && !reveal_secrets)
-                            .desired_width(170.0),
+                            .password(var.secret && !reveal_secrets),
                     )
                     .changed();
                 changed |= ui.checkbox(&mut var.secret, "").changed();
-                if ui.small_button("×").clicked() {
+                if ui.small_button("x").clicked() {
                     remove_idx = Some(idx);
                 }
                 ui.end_row();
