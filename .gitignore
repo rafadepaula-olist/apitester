@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+*.pdb
+.DS_Store
+*.db
+*.sqlite
+*.sqlite3
+.env
+.idea/
+.vscode/
