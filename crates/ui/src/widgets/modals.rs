@@ -632,10 +632,13 @@ fn render_load_tester_tab(ui: &mut egui::Ui, app: &mut ApiTesterApp) {
             }
             ui.spinner();
         } else if ui
-            .button(
-                RichText::new("Start Load Test")
-                    .strong()
-                    .color(Color32::from_rgb(255, 108, 55)),
+            .add(
+                egui::Button::new(
+                    RichText::new("Start Load Test")
+                        .strong()
+                        .color(Color32::WHITE),
+                )
+                .fill(crate::theme::ACCENT_PRIMARY),
             )
             .clicked()
         {

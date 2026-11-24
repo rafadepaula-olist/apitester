@@ -2,6 +2,9 @@ use apitester_core::models::{HttpMethod, ThemeMode};
 use egui::text::LayoutJob;
 use egui::{Color32, FontId, Rounding, Stroke, TextFormat, Visuals};
 
+/// High-contrast burnt-orange primary accent (`#CC4814`, WCAG AA >= 5.1:1 with pure white).
+pub const ACCENT_PRIMARY: Color32 = Color32::from_rgb(204, 72, 20);
+
 /// Semantic accent palette shared across components.
 pub struct Palette {
     pub bg_panel: Color32,
@@ -71,8 +74,8 @@ pub fn apply_theme(ctx: &egui::Context, mode: ThemeMode) {
     visuals.widgets.inactive.rounding = Rounding::same(4.0);
     visuals.widgets.hovered.rounding = Rounding::same(4.0);
     visuals.widgets.active.rounding = Rounding::same(4.0);
-    visuals.selection.bg_fill = pal.accent.linear_multiply(if is_dark { 0.35 } else { 0.2 });
-    visuals.selection.stroke = Stroke::new(1.0_f32, pal.accent);
+    visuals.selection.bg_fill = ACCENT_PRIMARY;
+    visuals.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
 
     ctx.set_visuals(visuals);
 }

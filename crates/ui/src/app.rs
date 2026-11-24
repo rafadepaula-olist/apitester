@@ -32,7 +32,7 @@ use crate::state::{
     ImportFormat, LoadProfileKind, ModalState, RequestSubTab, ResponseBodyView, ResponseSubTab,
     RunnerModalTab, SidebarTab, UiMessage, WorkbenchTab,
 };
-use crate::theme::{apply_theme, highlight_body, method_color, status_color};
+use crate::theme::{apply_theme, highlight_body, method_color, status_color, ACCENT_PRIMARY};
 use crate::widgets::auth_editor::auth_editor_ui;
 use crate::widgets::kv_table::{form_data_table_ui, kv_table_ui, variables_table_ui};
 use crate::widgets::modals::render_modals;
@@ -615,11 +615,11 @@ impl ApiTesterApp {
                         .color(Color32::from_rgb(255, 108, 55)),
                 );
 
-                ui.add_space(8.0);
+                ui.add_space(4.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.search_query)
-                        .hint_text("Search collections & history...")
-                        .desired_width(210.0),
+                        .hint_text("Search...")
+                        .desired_width(165.0),
                 );
 
                 ui.menu_button("+ New", |ui| {
@@ -717,7 +717,7 @@ impl ApiTesterApp {
                         .unwrap_or("No Environment");
 
                     ComboBox::from_id_salt("active_env_combo")
-                        .width(150.0)
+                        .width(130.0)
                         .selected_text(active_env_name)
                         .show_ui(ui, |ui| {
                             if ui
@@ -749,8 +749,8 @@ impl ApiTesterApp {
             return;
         }
         SidePanel::left("sidebar")
-            .default_width(275.0)
-            .min_width(210.0)
+            .default_width(280.0)
+            .min_width(240.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.selectable_value(
@@ -1040,7 +1040,12 @@ impl ApiTesterApp {
                         ProtocolConfig::Sse { .. } => "SSE",
                     };
                     let dirty_mark = if tab.dirty { " *" } else { "" };
-                    let label = format!("{badge} {}{dirty_mark}", tab.title);
+                    let label_text = format!("{badge} {}{dirty_mark}", tab.title);
+                    let label = if selected {
+                        RichText::new(label_text).strong().color(Color32::WHITE)
+                    } else {
+                        RichText::new(label_text)
+                    };
                     if ui.selectable_label(selected, label).clicked() {
                         self.active_tab = idx;
                     }
@@ -1150,10 +1155,9 @@ impl ApiTesterApp {
                         tab.in_flight = false;
                     }
                 } else if ui
-                    .button(
-                        RichText::new("Send")
-                            .strong()
-                            .color(Color32::from_rgb(255, 108, 55)),
+                    .add(
+                        egui::Button::new(RichText::new("Send").strong().color(Color32::WHITE))
+                            .fill(ACCENT_PRIMARY),
                     )
                     .clicked()
                 {
