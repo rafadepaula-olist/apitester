@@ -6,3 +6,8 @@ license.workspace = true
 
 [dependencies]
 apitester-core.workspace = true
+base64 = "0.22"
+chrono.workspace = true
+rquickjs = "0.9"
+serde.workspace = true
+serde_json.workspace = true

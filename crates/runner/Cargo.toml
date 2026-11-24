@@ -5,4 +5,15 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+apitester-auth = { path = "../auth" }
 apitester-core.workspace = true
+apitester-net = { path = "../net" }
+apitester-scripting = { path = "../scripting" }
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_urlencoded = "0.7"
+thiserror.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+url = "2"
+uuid.workspace = true

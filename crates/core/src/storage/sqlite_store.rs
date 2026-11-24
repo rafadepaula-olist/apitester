@@ -181,7 +181,8 @@ impl SqliteStore {
         let mut stmt = self.conn.prepare(
             "SELECT domain, path, name, value, expires, http_only, secure, same_site
              FROM cookies
-             WHERE domain = ?1 OR ?1 LIKE ('%.' || LTRIM(domain, '.'))
+             WHERE LTRIM(LOWER(domain), '.') = LOWER(?1)
+                OR LOWER(?1) LIKE ('%.' || LTRIM(LOWER(domain), '.'))
              ORDER BY domain, path, name",
         )?;
 

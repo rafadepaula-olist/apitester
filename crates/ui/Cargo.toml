@@ -4,5 +4,31 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "apitester_ui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "apitester"
+path = "src/main.rs"
+
 [dependencies]
+apitester-auth = { path = "../auth" }
 apitester-core.workspace = true
+apitester-import-export = { path = "../import_export" }
+apitester-net = { path = "../net" }
+apitester-proxy = { path = "../proxy" }
+apitester-runner = { path = "../runner" }
+apitester-scripting = { path = "../scripting" }
+chrono.workspace = true
+dirs = "5"
+eframe = "0.29"
+egui = "0.29"
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "1", features = ["full"] }
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

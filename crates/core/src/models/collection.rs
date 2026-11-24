@@ -9,6 +9,7 @@ use super::settings::Variable;
 /// Node in a collection tree: either a nested `Folder` or a leaf `RequestItem`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "node_type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum CollectionNode {
     Folder(Folder),
     Request(RequestItem),

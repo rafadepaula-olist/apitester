@@ -6,3 +6,14 @@ license.workspace = true
 
 [dependencies]
 apitester-core.workspace = true
+apitester-import-export = { path = "../import_export" }
+apitester-proxy = { path = "../proxy" }
+apitester-runner = { path = "../runner" }
+clap = { version = "4", features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { version = "1", features = ["net", "io-util"] }

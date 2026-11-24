@@ -6,3 +6,16 @@ license.workspace = true
 
 [dependencies]
 apitester-core.workspace = true
+bytes = "1"
+chrono.workspace = true
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio", "client", "client-legacy", "http1"] }
+rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+serde.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
