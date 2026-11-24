@@ -37,6 +37,7 @@ fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("APITester")
+            .with_app_id("apitester")
             .with_inner_size([1360.0, 860.0])
             .with_min_inner_size([960.0, 600.0]),
         ..Default::default()
