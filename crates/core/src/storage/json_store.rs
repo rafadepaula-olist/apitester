@@ -53,8 +53,11 @@ impl JsonStore {
         for entry in fs::read_dir(self.collections_dir())? {
             let path = entry?.path();
             if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                let raw = fs::read_to_string(&path)?;
-                collections.push(serde_json::from_str(&raw)?);
+                if let Ok(raw) = fs::read_to_string(&path) {
+                    if let Ok(col) = serde_json::from_str::<Collection>(&raw) {
+                        collections.push(col);
+                    }
+                }
             }
         }
         collections.sort_by(|a, b| a.name.cmp(&b.name));
@@ -90,8 +93,11 @@ impl JsonStore {
         for entry in fs::read_dir(self.environments_dir())? {
             let path = entry?.path();
             if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                let raw = fs::read_to_string(&path)?;
-                envs.push(serde_json::from_str(&raw)?);
+                if let Ok(raw) = fs::read_to_string(&path) {
+                    if let Ok(env) = serde_json::from_str::<Environment>(&raw) {
+                        envs.push(env);
+                    }
+                }
             }
         }
         envs.sort_by(|a, b| a.name.cmp(&b.name));

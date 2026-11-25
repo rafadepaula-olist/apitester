@@ -110,6 +110,7 @@ pub struct ApiTesterApp {
     pub load_summary: Option<LoadTestSummary>,
 
     pub screenshot_tour: Option<ScreenshotTour>,
+    pub status_toast: Option<(String, std::time::Instant)>,
     focus_url_next: bool,
     focus_search_next: bool,
     theme_applied: Option<ThemeMode>,
@@ -196,6 +197,7 @@ impl ApiTesterApp {
             load_timeline: Vec::new(),
             load_summary: None,
             screenshot_tour,
+            status_toast: None,
             focus_url_next: false,
             focus_search_next: false,
             theme_applied: None,
@@ -322,12 +324,82 @@ impl ApiTesterApp {
         }
     }
 
+    pub fn notify_status(&mut self, msg: impl Into<String>) {
+        self.status_toast = Some((msg.into(), std::time::Instant::now()));
+    }
+
+    pub fn log_storage_error(&mut self, context: &str, err: impl std::fmt::Display) {
+        let msg = format!("Storage error ({context}): {err}");
+        self.console_logs.push(ConsoleLogEntry {
+            level: ConsoleLogLevel::Error,
+            message: msg.clone(),
+            timestamp: Utc::now(),
+        });
+        self.notify_status(msg);
+    }
+
+    pub fn persist_collection(&mut self, col: &Collection) -> bool {
+        match self.json_store.save_collection(col) {
+            Ok(_) => true,
+            Err(e) => {
+                self.log_storage_error("save_collection", e);
+                false
+            }
+        }
+    }
+
+    pub fn persist_environment(&mut self, env: &Environment) -> bool {
+        match self.json_store.save_environment(env) {
+            Ok(_) => true,
+            Err(e) => {
+                self.log_storage_error("save_environment", e);
+                false
+            }
+        }
+    }
+
+    pub fn persist_settings(&mut self) -> bool {
+        match self.sqlite_store.save_settings(&self.settings) {
+            Ok(()) => true,
+            Err(e) => {
+                self.log_storage_error("save_settings", e);
+                false
+            }
+        }
+    }
+
+    /// Flushes any dirty request tabs, all collections, all environments, and settings to disk.
+    pub fn persist_all(&mut self) {
+        let dirty_indices: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| t.as_request().filter(|r| r.dirty).map(|_| i))
+            .collect();
+        let prev_active = self.active_tab;
+        for idx in dirty_indices {
+            self.active_tab = idx;
+            self.save_active_tab();
+        }
+        self.active_tab = prev_active.min(self.tabs.len().saturating_sub(1));
+
+        let cols = self.collections.clone();
+        for col in &cols {
+            let _ = self.persist_collection(col);
+        }
+        let envs = self.environments.clone();
+        for env in &envs {
+            let _ = self.persist_environment(env);
+        }
+        let _ = self.persist_settings();
+    }
+
     pub fn toggle_theme(&mut self) {
         self.settings.theme = match self.settings.theme {
             ThemeMode::Light => ThemeMode::Dark,
             ThemeMode::Dark | ThemeMode::System => ThemeMode::Light,
         };
-        let _ = self.sqlite_store.save_settings(&self.settings);
+        self.persist_settings();
     }
 
     fn find_request_tab_mut(&mut self, tab_id: Uuid) -> Option<&mut WorkbenchTab> {
@@ -572,17 +644,30 @@ impl ApiTesterApp {
         env_vars: HashMap<String, String>,
         (col_id, col_vars): (Option<Uuid>, HashMap<String, String>),
     ) {
-        merge_var_map(&mut self.settings.global_variables, &globals);
+        if !globals.is_empty() {
+            merge_var_map(&mut self.settings.global_variables, &globals);
+            self.persist_settings();
+        }
         if let Some(eid) = self.settings.active_environment_id {
-            if let Some(env) = self.environments.iter_mut().find(|e| e.id == eid) {
+            let saved_env = if let Some(env) = self.environments.iter_mut().find(|e| e.id == eid) {
                 merge_var_map(&mut env.variables, &env_vars);
-                let _ = self.json_store.save_environment(env);
+                Some(env.clone())
+            } else {
+                None
+            };
+            if let Some(env) = saved_env {
+                self.persist_environment(&env);
             }
         }
         if let Some(cid) = col_id {
-            if let Some(col) = self.collections.iter_mut().find(|c| c.id == cid) {
+            let saved_col = if let Some(col) = self.collections.iter_mut().find(|c| c.id == cid) {
                 merge_var_map(&mut col.variables, &col_vars);
-                let _ = self.json_store.save_collection(col);
+                Some(col.clone())
+            } else {
+                None
+            };
+            if let Some(col) = saved_col {
+                self.persist_collection(&col);
             }
         }
     }
@@ -741,32 +826,45 @@ impl ApiTesterApp {
         }
     }
 
-    fn save_active_tab(&mut self) {
+    pub fn save_active_tab(&mut self) {
         let Some(tab) = self.tabs.get_mut(self.active_tab).and_then(AppTab::as_request_mut) else {
             return;
         };
         tab.dirty = false;
-        tab.title = tab.request.name.clone();
+        if !tab.request.name.trim().is_empty() {
+            tab.title = tab.request.name.clone();
+        }
         let req = tab.request.clone();
         let col_id = tab.collection_id;
 
-        if let Some(cid) = col_id {
+        let target_col = if let Some(cid) = col_id {
             if let Some(col) = self.collections.iter_mut().find(|c| c.id == cid) {
                 if !update_request_in_nodes(&mut col.items, &req) {
                     col.items.push(CollectionNode::Request(req));
                 }
                 col.updated_at = Utc::now();
-                let _ = self.json_store.save_collection(col);
+                Some(col.clone())
+            } else {
+                None
             }
         } else {
             if self.collections.is_empty() {
-                self.collections.push(Collection::new("My Collection"));
+                self.collections.push(Collection::new("Default"));
             }
             let cid = self.collections[0].id;
-            self.collections[0].items.push(CollectionNode::Request(req));
-            let _ = self.json_store.save_collection(&self.collections[0]);
+            if !update_request_in_nodes(&mut self.collections[0].items, &req) {
+                self.collections[0].items.push(CollectionNode::Request(req));
+            }
+            self.collections[0].updated_at = Utc::now();
             if let Some(tab) = self.tabs.get_mut(self.active_tab).and_then(AppTab::as_request_mut) {
                 tab.collection_id = Some(cid);
+            }
+            Some(self.collections[0].clone())
+        };
+
+        if let Some(col) = target_col {
+            if self.persist_collection(&col) {
+                self.notify_status(format!("Saved to '{}'", col.name));
             }
         }
     }
@@ -1075,7 +1173,9 @@ impl ApiTesterApp {
                                         "Collection {}",
                                         self.collections.len() + 1
                                     ));
-                                    let _ = self.json_store.save_collection(&col);
+                                    if self.persist_collection(&col) {
+                                        self.notify_status(format!("Created '{}'", col.name));
+                                    }
                                     self.collections.push(col);
                                 }
                             }
@@ -1085,7 +1185,9 @@ impl ApiTesterApp {
                                         "Environment {}",
                                         self.environments.len() + 1
                                     ));
-                                    let _ = self.json_store.save_environment(&env);
+                                    if self.persist_environment(&env) {
+                                        self.notify_status(format!("Created '{}'", env.name));
+                                    }
                                     self.environments.push(env);
                                 }
                             }
@@ -1201,22 +1303,39 @@ impl ApiTesterApp {
             self.open_or_focus_collection_settings(cid);
         }
         if let Some(cid) = add_req_col {
+            let mut created = None;
+            let mut saved_col = None;
             if let Some(col) = self.collections.iter_mut().find(|c| c.id == cid) {
                 let req = RequestItem::new("New Request", HttpMethod::Get, "https://httpbin.org/get");
                 col.items.push(CollectionNode::Request(req.clone()));
-                let _ = self.json_store.save_collection(col);
+                col.updated_at = Utc::now();
+                saved_col = Some(col.clone());
+                created = Some(req);
+            }
+            if let Some(col) = saved_col {
+                self.persist_collection(&col);
+            }
+            if let Some(req) = created {
                 self.open_or_focus_request(req, Some(cid));
             }
         }
         if let Some(cid) = add_folder_col {
-            if let Some(col) = self.collections.iter_mut().find(|c| c.id == cid) {
+            let saved_col = if let Some(col) = self.collections.iter_mut().find(|c| c.id == cid) {
                 col.items.push(CollectionNode::Folder(Folder::new("New Folder")));
-                let _ = self.json_store.save_collection(col);
+                col.updated_at = Utc::now();
+                Some(col.clone())
+            } else {
+                None
+            };
+            if let Some(col) = saved_col {
+                self.persist_collection(&col);
             }
         }
         if let Some(cid) = delete_col_id {
             self.collections.retain(|c| c.id != cid);
-            let _ = self.json_store.delete_collection(cid);
+            if let Err(e) = self.json_store.delete_collection(cid) {
+                self.log_storage_error("delete_collection", e);
+            }
         }
     }
 
@@ -1273,13 +1392,17 @@ impl ApiTesterApp {
             }
 
             if let Some(idx) = save_env_idx {
-                let _ = self.json_store.save_environment(&self.environments[idx]);
+                let env = self.environments[idx].clone();
+                self.persist_environment(&env);
             }
             if let Some(eid) = delete_env {
                 self.environments.retain(|e| e.id != eid);
-                let _ = self.json_store.delete_environment(eid);
+                if let Err(e) = self.json_store.delete_environment(eid) {
+                    self.log_storage_error("delete_environment", e);
+                }
                 if self.settings.active_environment_id == Some(eid) {
                     self.settings.active_environment_id = None;
+                    self.persist_settings();
                 }
             }
         });
@@ -1371,6 +1494,15 @@ impl ApiTesterApp {
                     }
                     if self.console_open && ghost_button(ui, "Clear", pal).clicked() {
                         self.console_logs.clear();
+                    }
+                    if let Some((msg, at)) = &self.status_toast {
+                        if at.elapsed() < std::time::Duration::from_secs(4) {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(RichText::new(msg).small().color(pal.info));
+                            });
+                        } else {
+                            self.status_toast = None;
+                        }
                     }
                 });
 
@@ -2096,6 +2228,10 @@ impl eframe::App for ApiTesterApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.persist_all();
+    }
 }
 
 fn rail_button(ui: &mut Ui, label: &str, active: bool, pal: &Palette) -> egui::Response {
@@ -2811,5 +2947,131 @@ mod tests {
         let tab = app.tabs[0].as_request().unwrap();
         assert!(!tab.in_flight, "unresolved URL stayed in_flight");
         assert!(tab.last_error.is_some(), "expected invalid URL error");
+    }
+
+    #[test]
+    fn full_restart_persistence_collections_edits_envs_globals_and_settings() {
+        use std::io::Write;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let data_dir = tempdir().unwrap();
+
+        // Session 1: import, create, edit nested request, save, edit vars/env/globals/settings
+        {
+            let mut app = ApiTesterApp::new_headless(
+                rt.handle().clone(),
+                LaunchConfig {
+                    demo_mode: false,
+                    data_dir: Some(data_dir.path().to_path_buf()),
+                    screenshot_dir: None,
+                },
+            );
+
+            // 1. Import a Postman v2.1 collection from file
+            let mut tmp = tempfile::NamedTempFile::new().unwrap();
+            tmp.write_all(
+                br#"{
+                "info": {
+                    "name": "Imported Shop",
+                    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+                },
+                "item": [
+                    { "name": "Ping", "request": { "method": "GET", "url": "https://shop.test/ping" } }
+                ]
+            }"#,
+            )
+            .unwrap();
+            let (_, _, status) = import_from_file_path(&mut app, tmp.path());
+            assert!(status.contains("Imported Shop"), "status: {status}");
+
+            // 2. Create a second collection with nested folder + request + collection variable
+            let mut col2 = Collection::new("Custom API");
+            col2.variables.push(Variable::new("apiVer", "v2"));
+            let mut folder = Folder::new("Users");
+            let req = RequestItem::new("Get Profile", HttpMethod::Get, "https://api.test/v2/me");
+            let req_id = req.id;
+            folder.items.push(CollectionNode::Request(req.clone()));
+            col2.items.push(CollectionNode::Folder(folder));
+            let col2_id = col2.id;
+            assert!(app.persist_collection(&col2));
+            app.collections.push(col2);
+
+            // 3. Open nested request, edit URL + params, and save via save_active_tab()
+            app.open_or_focus_request(req, Some(col2_id));
+            if let Some(tab) = app.tabs[app.active_tab].as_request_mut() {
+                tab.request.url = "https://api.test/v2/profile?full=1".into();
+                tab.request.params.push(KeyValue::new("full", "1"));
+                tab.dirty = true;
+            }
+            app.save_active_tab();
+            assert_eq!(
+                app.collections
+                    .iter()
+                    .find(|c| c.id == col2_id)
+                    .unwrap()
+                    .find_request(req_id)
+                    .unwrap()
+                    .url,
+                "https://api.test/v2/profile?full=1"
+            );
+
+            // 4. Create & edit an environment, globals, and settings
+            let mut env = Environment::new("Staging");
+            env.variables.push(Variable::new("host", "staging.test"));
+            let env_id = env.id;
+            assert!(app.persist_environment(&env));
+            app.environments.push(env);
+
+            app.settings.active_environment_id = Some(env_id);
+            app.settings.theme = ThemeMode::Light;
+            app.settings.timeout_ms = 12_500;
+            app.settings
+                .global_variables
+                .push(Variable::new("globalKey", "globalVal"));
+            assert!(app.persist_settings());
+        }
+
+        // Session 2: fresh ApiTesterApp from the same data_dir
+        let reloaded = ApiTesterApp::new_headless(
+            rt.handle().clone(),
+            LaunchConfig {
+                demo_mode: false,
+                data_dir: Some(data_dir.path().to_path_buf()),
+                screenshot_dir: None,
+            },
+        );
+
+        assert_eq!(reloaded.collections.len(), 2);
+        assert!(reloaded.collections.iter().any(|c| c.name == "Imported Shop"));
+        let custom = reloaded
+            .collections
+            .iter()
+            .find(|c| c.name == "Custom API")
+            .expect("Custom API persisted");
+        assert_eq!(custom.variables.len(), 1);
+        assert_eq!(custom.variables[0].value, "v2");
+        let saved_req = match &custom.items[0] {
+            CollectionNode::Folder(f) => match &f.items[0] {
+                CollectionNode::Request(r) => r,
+                _ => panic!("expected request"),
+            },
+            _ => panic!("expected folder"),
+        };
+        assert_eq!(saved_req.url, "https://api.test/v2/profile?full=1");
+        assert_eq!(saved_req.params.len(), 1);
+
+        assert_eq!(reloaded.environments.len(), 1);
+        assert_eq!(reloaded.environments[0].name, "Staging");
+        assert_eq!(reloaded.environments[0].variables[0].value, "staging.test");
+        assert_eq!(
+            reloaded.settings.active_environment_id,
+            Some(reloaded.environments[0].id)
+        );
+        assert_eq!(reloaded.settings.theme, ThemeMode::Light);
+        assert_eq!(reloaded.settings.timeout_ms, 12_500);
+        assert_eq!(reloaded.settings.global_variables.len(), 1);
+        assert_eq!(reloaded.settings.global_variables[0].value, "globalVal");
     }
 }

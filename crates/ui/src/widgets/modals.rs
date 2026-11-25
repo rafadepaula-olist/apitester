@@ -483,6 +483,7 @@ pub fn render_settings_tab(ui: &mut Ui, ctx: &egui::Context, app: &mut ApiTester
     let is_dark = !matches!(app.settings.theme, ThemeMode::Light);
     let pal = Palette::for_mode(is_dark);
 
+    let mut changed = false;
     ScrollArea::vertical().id_salt("settings_tab_scroll").show(ui, |ui| {
         ui.heading("Settings");
         ui.add_space(10.0);
@@ -495,12 +496,12 @@ pub fn render_settings_tab(ui: &mut Ui, ctx: &egui::Context, app: &mut ApiTester
                 if underline_tab(ui, app.settings.theme != ThemeMode::Light, "Dark", &pal).clicked() {
                     app.settings.theme = ThemeMode::Dark;
                     apply_theme(ctx, app.settings.theme);
-                    let _ = app.sqlite_store.save_settings(&app.settings);
+                    changed = true;
                 }
                 if underline_tab(ui, app.settings.theme == ThemeMode::Light, "Light", &pal).clicked() {
                     app.settings.theme = ThemeMode::Light;
                     apply_theme(ctx, app.settings.theme);
-                    let _ = app.sqlite_store.save_settings(&app.settings);
+                    changed = true;
                 }
             });
         });
@@ -509,14 +510,22 @@ pub fn render_settings_tab(ui: &mut Ui, ctx: &egui::Context, app: &mut ApiTester
         section_card(ui, &pal, |ui| {
             ui.label(RichText::new("Network & TLS").strong().size(15.0));
             ui.add_space(6.0);
-            ui.checkbox(&mut app.settings.verify_ssl, "Verify SSL certificates");
-            ui.checkbox(&mut app.settings.follow_redirects, "Follow HTTP redirects");
+            changed |= ui
+                .checkbox(&mut app.settings.verify_ssl, "Verify SSL certificates")
+                .changed();
+            changed |= ui
+                .checkbox(&mut app.settings.follow_redirects, "Follow HTTP redirects")
+                .changed();
             ui.horizontal(|ui| {
                 ui.label("Max Redirects:");
-                ui.add(egui::DragValue::new(&mut app.settings.max_redirects).range(0..=50));
+                changed |= ui
+                    .add(egui::DragValue::new(&mut app.settings.max_redirects).range(0..=50))
+                    .changed();
                 ui.add_space(12.0);
                 ui.label("Timeout (ms):");
-                ui.add(egui::DragValue::new(&mut app.settings.timeout_ms).range(0..=300_000));
+                changed |= ui
+                    .add(egui::DragValue::new(&mut app.settings.timeout_ms).range(0..=300_000))
+                    .changed();
             });
         });
 
@@ -524,26 +533,43 @@ pub fn render_settings_tab(ui: &mut Ui, ctx: &egui::Context, app: &mut ApiTester
         section_card(ui, &pal, |ui| {
             ui.label(RichText::new("Outbound Proxy").strong().size(15.0));
             ui.add_space(6.0);
-            ui.checkbox(&mut app.settings.proxy.enabled, "Enable outbound proxy");
+            changed |= ui
+                .checkbox(&mut app.settings.proxy.enabled, "Enable outbound proxy")
+                .changed();
             ui.horizontal(|ui| {
                 egui::ComboBox::from_id_salt("settings_proxy_type")
                     .selected_text(format!("{:?}", app.settings.proxy.proxy_type))
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut app.settings.proxy.proxy_type, ProxyType::Http, "HTTP");
-                        ui.selectable_value(&mut app.settings.proxy.proxy_type, ProxyType::Https, "HTTPS");
-                        ui.selectable_value(&mut app.settings.proxy.proxy_type, ProxyType::Socks5, "SOCKS5");
+                        changed |= ui
+                            .selectable_value(&mut app.settings.proxy.proxy_type, ProxyType::Http, "HTTP")
+                            .changed();
+                        changed |= ui
+                            .selectable_value(&mut app.settings.proxy.proxy_type, ProxyType::Https, "HTTPS")
+                            .changed();
+                        changed |= ui
+                            .selectable_value(&mut app.settings.proxy.proxy_type, ProxyType::Socks5, "SOCKS5")
+                            .changed();
                     });
-                ui.add(egui::TextEdit::singleline(&mut app.settings.proxy.host).desired_width(200.0));
-                ui.add(egui::DragValue::new(&mut app.settings.proxy.port).range(1..=65535));
+                changed |= ui
+                    .add(egui::TextEdit::singleline(&mut app.settings.proxy.host).desired_width(200.0))
+                    .changed();
+                changed |= ui
+                    .add(egui::DragValue::new(&mut app.settings.proxy.port).range(1..=65535))
+                    .changed();
             });
         });
 
         ui.add_space(12.0);
         if primary_button(ui, "Save Settings", Vec2::new(124.0, 32.0)).clicked() {
-            let _ = app.sqlite_store.save_settings(&app.settings);
+            changed = true;
             apply_theme(ctx, app.settings.theme);
+            app.notify_status("Settings saved");
         }
     });
+
+    if changed {
+        app.persist_settings();
+    }
 }
 
 /// Renders the full-viewport Collection Auth & Variables Workbench Tab.
@@ -552,6 +578,7 @@ pub fn render_collection_settings_tab(ui: &mut Ui, app: &mut ApiTesterApp, colle
     let pal = Palette::for_mode(is_dark);
 
     let mut save = false;
+    let mut explicit_save = false;
     ScrollArea::vertical().id_salt("col_settings_tab_scroll").show(ui, |ui| {
         if let Some(col) = app.collections.iter_mut().find(|c| c.id == collection_id) {
             ui.heading(format!("Collection Settings — {}", col.name));
@@ -560,7 +587,9 @@ pub fn render_collection_settings_tab(ui: &mut Ui, app: &mut ApiTesterApp, colle
             section_card(ui, &pal, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Collection Name:");
-                    ui.add(egui::TextEdit::singleline(&mut col.name).desired_width(280.0));
+                    save |= ui
+                        .add(egui::TextEdit::singleline(&mut col.name).desired_width(280.0))
+                        .changed();
                 });
             });
 
@@ -568,19 +597,20 @@ pub fn render_collection_settings_tab(ui: &mut Ui, app: &mut ApiTesterApp, colle
             section_card(ui, &pal, |ui| {
                 ui.label(RichText::new("Collection Authorization").strong().size(15.0));
                 ui.add_space(6.0);
-                auth_editor_ui(ui, "col_auth_editor", &mut col.auth);
+                save |= auth_editor_ui(ui, "col_auth_editor", &mut col.auth);
             });
 
             ui.add_space(10.0);
             section_card(ui, &pal, |ui| {
                 ui.label(RichText::new("Collection Variables").strong().size(15.0));
                 ui.add_space(6.0);
-                variables_table_ui(ui, "col_vars_editor", &mut col.variables, app.reveal_secrets);
+                save |= variables_table_ui(ui, "col_vars_editor", &mut col.variables, app.reveal_secrets);
             });
 
             ui.add_space(12.0);
             if primary_button(ui, "Save Collection", Vec2::new(132.0, 32.0)).clicked() {
                 save = true;
+                explicit_save = true;
             }
         } else {
             ui.label(RichText::new("Collection not found.").color(pal.text_muted));
@@ -588,8 +618,15 @@ pub fn render_collection_settings_tab(ui: &mut Ui, app: &mut ApiTesterApp, colle
     });
 
     if save {
-        if let Some(col) = app.collections.iter().find(|c| c.id == collection_id) {
-            let _ = app.json_store.save_collection(col);
+        let maybe_col = app
+            .collections
+            .iter()
+            .find(|c| c.id == collection_id)
+            .cloned();
+        if let Some(col) = maybe_col {
+            if app.persist_collection(&col) && explicit_save {
+                app.notify_status(format!("Saved collection '{}'", col.name));
+            }
         }
     }
 }
@@ -821,18 +858,28 @@ fn run_import(app: &mut ApiTesterApp, format: ImportFormat, input: &str) -> Stri
             Ok(col) => {
                 let name = col.name.clone();
                 let count = col.items.len();
-                let _ = app.json_store.save_collection(&col);
+                let ok = app.persist_collection(&col);
                 app.collections.push(col);
-                format!("Imported Postman v2.1 collection '{name}' ({count} top-level items).")
+                if ok {
+                    app.notify_status(format!("Imported '{name}'"));
+                    format!("Imported Postman v2.1 collection '{name}' ({count} top-level items).")
+                } else {
+                    format!("Imported '{name}' in memory, but failed to save to disk (see Wire Console).")
+                }
             }
             Err(e) => format!("Postman import failed: {e}"),
         },
         ImportFormat::PostmanEnvironment => match import_postman_environment(input) {
             Ok(env) => {
                 let name = env.name.clone();
-                let _ = app.json_store.save_environment(&env);
+                let ok = app.persist_environment(&env);
                 app.environments.push(env);
-                format!("Imported Postman environment '{name}'.")
+                if ok {
+                    app.notify_status(format!("Imported environment '{name}'"));
+                    format!("Imported Postman environment '{name}'.")
+                } else {
+                    format!("Imported '{name}' in memory, but failed to save to disk (see Wire Console).")
+                }
             }
             Err(e) => format!("Environment import failed: {e}"),
         },
@@ -849,18 +896,28 @@ fn run_import(app: &mut ApiTesterApp, format: ImportFormat, input: &str) -> Stri
         ImportFormat::OpenApi => match import_openapi(input) {
             Ok(col) => {
                 let name = col.name.clone();
-                let _ = app.json_store.save_collection(&col);
+                let ok = app.persist_collection(&col);
                 app.collections.push(col);
-                format!("Imported OpenAPI/Swagger spec as collection '{name}'.")
+                if ok {
+                    app.notify_status(format!("Imported '{name}'"));
+                    format!("Imported OpenAPI/Swagger spec as collection '{name}'.")
+                } else {
+                    format!("Imported '{name}' in memory, but failed to save to disk (see Wire Console).")
+                }
             }
             Err(e) => format!("OpenAPI import failed: {e}"),
         },
         ImportFormat::Har => match import_har(input) {
             Ok(col) => {
                 let name = col.name.clone();
-                let _ = app.json_store.save_collection(&col);
+                let ok = app.persist_collection(&col);
                 app.collections.push(col);
-                format!("Imported HAR 1.2 recording as collection '{name}'.")
+                if ok {
+                    app.notify_status(format!("Imported '{name}'"));
+                    format!("Imported HAR 1.2 recording as collection '{name}'.")
+                } else {
+                    format!("Imported '{name}' in memory, but failed to save to disk (see Wire Console).")
+                }
             }
             Err(e) => format!("HAR import failed: {e}"),
         },
