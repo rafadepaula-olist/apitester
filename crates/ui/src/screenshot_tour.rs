@@ -5,7 +5,9 @@ use apitester_import_export::{generate_code, CodegenLanguage};
 use egui::{Event, ViewportCommand};
 
 use crate::app::ApiTesterApp;
-use crate::state::{ModalState, RequestSubTab, ResponseSubTab, RunnerModalTab, SidebarTab};
+use crate::state::{
+    ImportFormat, ModalState, RequestSubTab, ResponseSubTab, RunnerModalTab, SidebarTab,
+};
 
 const TOUR_STEPS: &[&str] = &[
     "01_http_workbench_dark.png",
@@ -15,6 +17,7 @@ const TOUR_STEPS: &[&str] = &[
     "05_import_export_codegen.png",
     "06_capture_proxy.png",
     "07_realtime_protocols.png",
+    "08_import_export_modal.png",
 ];
 
 /// State machine driving automated `--screenshot-tour <dir>` captures.
@@ -185,6 +188,22 @@ fn configure_step(app: &mut ApiTesterApp, step: usize) {
             if app.tabs.len() > 2 {
                 app.active_tab = 2; // WebSocket demo tab
             }
+        }
+        7 => {
+            // 08_import_export_modal.png — populate a large multi-hundred-line JSON to verify scroll containment
+            app.settings.theme = ThemeMode::Dark;
+            app.active_tab = 0;
+            let large_json = app
+                .collections
+                .first()
+                .and_then(|c| apitester_import_export::export_postman_collection(c).ok())
+                .map(|s| format!("{s}\n{s}\n{s}"))
+                .unwrap_or_default();
+            app.modal = ModalState::ImportExport {
+                format: ImportFormat::PostmanCollection,
+                input_text: large_json,
+                status: "Ready to import (choose a file, drop one here, or click Import).".into(),
+            };
         }
         _ => {}
     }

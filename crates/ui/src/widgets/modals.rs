@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -33,6 +34,9 @@ const CODEGEN_LANGS: &[(CodegenLanguage, &str)] = &[
 
 /// Renders whichever modal window is currently active.
 pub fn render_modals(ctx: &egui::Context, app: &mut ApiTesterApp) {
+    let max_h = (ctx.screen_rect().height() - 64.0).max(260.0);
+    let max_w = (ctx.screen_rect().width() - 64.0).max(360.0);
+
     let modal = app.modal.clone();
     match modal {
         ModalState::None => {}
@@ -41,13 +45,80 @@ pub fn render_modals(ctx: &egui::Context, app: &mut ApiTesterApp) {
             mut input_text,
             mut status,
         } => {
+            // Handle drag-and-drop files while the Import/Export modal is open.
+            let dropped_paths: Vec<_> = ctx.input(|i| {
+                i.raw
+                    .dropped_files
+                    .iter()
+                    .filter_map(|f| f.path.clone())
+                    .collect()
+            });
+            if let Some(path) = dropped_paths.first() {
+                let (detected, text, msg) = import_from_file_path(app, path);
+                format = detected;
+                input_text = text;
+                status = msg;
+            }
+
             let mut open = true;
             Window::new("Import / Export (Postman v2.1, cURL, OpenAPI, HAR)")
                 .open(&mut open)
-                .default_size([680.0, 480.0])
+                .collapsible(false)
+                .default_size([700.0_f32.min(max_w), 500.0_f32.min(max_h)])
+                .max_width(max_w)
+                .max_height(max_h)
+                .vscroll(true)
                 .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Import Format:");
+                    // Primary action row always visible at top without scrolling.
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Choose File...")
+                                        .strong()
+                                        .color(Color32::WHITE),
+                                )
+                                .fill(crate::theme::ACCENT_PRIMARY),
+                            )
+                            .clicked()
+                        {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("API Files", &["json", "yaml", "yml", "har", "txt"])
+                                .pick_file()
+                            {
+                                let (detected, text, msg) = import_from_file_path(app, &path);
+                                format = detected;
+                                input_text = text;
+                                status = msg;
+                            }
+                        }
+                        if ui
+                            .add_enabled(
+                                !input_text.trim().is_empty(),
+                                egui::Button::new(
+                                    RichText::new("Import")
+                                        .strong()
+                                        .color(Color32::WHITE),
+                                )
+                                .fill(crate::theme::ACCENT_PRIMARY),
+                            )
+                            .clicked()
+                        {
+                            status = run_import(app, format, &input_text);
+                        }
+                        if ui
+                            .add_enabled(!input_text.is_empty(), egui::Button::new("Clear"))
+                            .clicked()
+                        {
+                            input_text.clear();
+                            status.clear();
+                        }
+                        ui.weak("or drag & drop a file here");
+                    });
+
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Format:");
                         ui.selectable_value(
                             &mut format,
                             ImportFormat::PostmanCollection,
@@ -64,19 +135,22 @@ pub fn render_modals(ctx: &egui::Context, app: &mut ApiTesterApp) {
                     });
 
                     ui.add_space(4.0);
-                    ui.add(
-                        egui::TextEdit::multiline(&mut input_text)
-                            .desired_rows(15)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("Paste Postman v2.1 JSON, cURL command, OpenAPI JSON/YAML, or HAR 1.2 JSON...")
-                            .code_editor(),
-                    );
+                    ScrollArea::vertical()
+                        .id_salt("import_export_text_scroll")
+                        .max_height(240.0)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut input_text)
+                                    .desired_rows(12)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("Paste Postman v2.1 JSON, cURL command, OpenAPI JSON/YAML, or HAR 1.2 JSON...")
+                                    .code_editor(),
+                            );
+                        });
 
+                    ui.add_space(4.0);
                     ui.horizontal_wrapped(|ui| {
-                        if ui.button("Import").clicked() {
-                            status = run_import(app, format, &input_text);
-                        }
-                        if ui.button("Export Postman Collection v2.1").clicked() {
+                        if ui.button("Export Postman v2.1").clicked() {
                             if let Some(col) = app.collections.first() {
                                 match export_postman_collection(col) {
                                     Ok(json) => {
@@ -114,6 +188,25 @@ pub fn render_modals(ctx: &egui::Context, app: &mut ApiTesterApp) {
                                 status = "Exported active request as cURL.".into();
                             }
                         }
+                        if ui
+                            .add_enabled(!input_text.trim().is_empty(), egui::Button::new("Save to File..."))
+                            .clicked()
+                        {
+                            let default_name = match format {
+                                ImportFormat::PostmanEnvironment => "environment.postman_environment.json",
+                                ImportFormat::Curl => "request.sh",
+                                _ => "collection.postman_collection.json",
+                            };
+                            if let Some(path) = rfd::FileDialog::new()
+                                .set_file_name(default_name)
+                                .save_file()
+                            {
+                                status = match std::fs::write(&path, &input_text) {
+                                    Ok(()) => format!("Saved to {}", path.display()),
+                                    Err(e) => format!("Save failed: {e}"),
+                                };
+                            }
+                        }
                     });
 
                     if !status.is_empty() {
@@ -138,7 +231,11 @@ pub fn render_modals(ctx: &egui::Context, app: &mut ApiTesterApp) {
             let mut open = true;
             Window::new("Code Snippet Generator")
                 .open(&mut open)
-                .default_size([660.0, 440.0])
+                .collapsible(false)
+                .default_size([660.0_f32.min(max_w), 440.0_f32.min(max_h)])
+                .max_width(max_w)
+                .max_height(max_h)
+                .vscroll(true)
                 .show(ctx, |ui| {
                     let prev = language;
                     ui.horizontal_wrapped(|ui| {
@@ -156,14 +253,17 @@ pub fn render_modals(ctx: &egui::Context, app: &mut ApiTesterApp) {
                         }
                     }
                     ui.separator();
-                    ScrollArea::vertical().show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut code)
-                                .desired_rows(18)
-                                .desired_width(f32::INFINITY)
-                                .code_editor(),
-                        );
-                    });
+                    ScrollArea::vertical()
+                        .id_salt("codegen_snippet_scroll")
+                        .max_height(300.0)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut code)
+                                    .desired_rows(16)
+                                    .desired_width(f32::INFINITY)
+                                    .code_editor(),
+                            );
+                        });
                 });
             app.modal = if open {
                 ModalState::CodeSnippet { language, code }
@@ -176,7 +276,11 @@ pub fn render_modals(ctx: &egui::Context, app: &mut ApiTesterApp) {
             let mut close_now = false;
             Window::new("Local Capture Proxy")
                 .open(&mut open)
-                .default_size([740.0, 460.0])
+                .collapsible(false)
+                .default_size([740.0_f32.min(max_w), 460.0_f32.min(max_h)])
+                .max_width(max_w)
+                .max_height(max_h)
+                .vscroll(true)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("Port:");
@@ -280,7 +384,11 @@ pub fn render_modals(ctx: &egui::Context, app: &mut ApiTesterApp) {
             let mut open = true;
             Window::new("Collection Runner & Native Load Tester")
                 .open(&mut open)
-                .default_size([760.0, 520.0])
+                .collapsible(false)
+                .default_size([760.0_f32.min(max_w), 520.0_f32.min(max_h)])
+                .max_width(max_w)
+                .max_height(max_h)
+                .vscroll(true)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.selectable_value(
@@ -310,7 +418,11 @@ pub fn render_modals(ctx: &egui::Context, app: &mut ApiTesterApp) {
             let mut close_now = false;
             Window::new("Settings")
                 .open(&mut open)
-                .default_size([520.0, 420.0])
+                .collapsible(false)
+                .default_size([520.0_f32.min(max_w), 420.0_f32.min(max_h)])
+                .max_width(max_w)
+                .max_height(max_h)
+                .vscroll(true)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("Theme:");
@@ -374,7 +486,11 @@ pub fn render_modals(ctx: &egui::Context, app: &mut ApiTesterApp) {
                 let mut save = false;
                 Window::new(format!("Collection Settings — {}", col.name))
                     .open(&mut open)
-                    .default_size([560.0, 440.0])
+                    .collapsible(false)
+                    .default_size([560.0_f32.min(max_w), 440.0_f32.min(max_h)])
+                    .max_width(max_w)
+                    .max_height(max_h)
+                    .vscroll(true)
                     .show(ctx, |ui| {
                         ui.horizontal(|ui| {
                             ui.label("Name:");
@@ -409,6 +525,62 @@ pub fn render_modals(ctx: &egui::Context, app: &mut ApiTesterApp) {
                 app.modal = ModalState::None;
             }
         }
+    }
+}
+
+/// Infers the most likely [`ImportFormat`] from a file extension and content snippet.
+pub fn detect_import_format(path: &Path, content: &str) -> ImportFormat {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if ext == "har" {
+        return ImportFormat::Har;
+    }
+    if ext == "yaml" || ext == "yml" {
+        return ImportFormat::OpenApi;
+    }
+
+    let trimmed = content.trim_start();
+    if trimmed.starts_with("curl ") {
+        return ImportFormat::Curl;
+    }
+
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if val.get("openapi").is_some() || val.get("swagger").is_some() {
+            return ImportFormat::OpenApi;
+        }
+        if val.get("log").and_then(|l| l.get("entries")).is_some() {
+            return ImportFormat::Har;
+        }
+        if val.get("_postman_variable_scope").is_some()
+            || (val.get("values").and_then(|v| v.as_array()).is_some() && val.get("item").is_none())
+        {
+            return ImportFormat::PostmanEnvironment;
+        }
+    }
+
+    ImportFormat::PostmanCollection
+}
+
+/// Reads an API file from disk, auto-detects its format, and imports it into `app`.
+pub fn import_from_file_path(
+    app: &mut ApiTesterApp,
+    path: &Path,
+) -> (ImportFormat, String, String) {
+    match std::fs::read_to_string(path) {
+        Ok(content) => {
+            let format = detect_import_format(path, &content);
+            let status = run_import(app, format, &content);
+            (format, content, status)
+        }
+        Err(e) => (
+            ImportFormat::PostmanCollection,
+            String::new(),
+            format!("Failed to read {}: {e}", path.display()),
+        ),
     }
 }
 
@@ -473,13 +645,18 @@ fn render_collection_runner_tab(ui: &mut egui::Ui, app: &mut ApiTesterApp) {
     });
 
     ui.collapsing("Iteration Data (CSV or JSON array)", |ui| {
-        ui.add(
-            egui::TextEdit::multiline(&mut app.runner_data_input)
-                .desired_rows(4)
-                .desired_width(f32::INFINITY)
-                .hint_text("id,name\n1,Ada\n2,Grace  -- or JSON [{\"id\":\"1\"}]")
-                .code_editor(),
-        );
+        ScrollArea::vertical()
+            .id_salt("runner_data_scroll")
+            .max_height(140.0)
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut app.runner_data_input)
+                        .desired_rows(4)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("id,name\n1,Ada\n2,Grace  -- or JSON [{\"id\":\"1\"}]")
+                        .code_editor(),
+                );
+            });
     });
 
     ui.add_space(4.0);
@@ -799,5 +976,59 @@ fn draw_load_chart(ui: &mut egui::Ui, points: &[LoadTimelinePoint]) {
             line_pts,
             Stroke::new(2.0_f32, Color32::from_rgb(255, 108, 55)),
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use tempfile::{tempdir, NamedTempFile};
+
+    use super::*;
+    use crate::app::LaunchConfig;
+
+    #[test]
+    fn import_from_file_path_loads_postman_v21_collection() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let data_dir = tempdir().unwrap();
+        let mut app = ApiTesterApp::new_headless(
+            rt.handle().clone(),
+            LaunchConfig {
+                demo_mode: false,
+                data_dir: Some(data_dir.path().to_path_buf()),
+                screenshot_dir: None,
+            },
+        );
+        assert!(app.collections.is_empty());
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        let postman_json = r#"{
+            "info": {
+                "name": "File Imported API",
+                "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+            },
+            "item": [
+                {
+                    "name": "Health Check",
+                    "request": {
+                        "method": "GET",
+                        "url": "https://api.example.com/health"
+                    }
+                }
+            ]
+        }"#;
+        tmp.write_all(postman_json.as_bytes()).unwrap();
+
+        let (format, content, status) = import_from_file_path(&mut app, tmp.path());
+        assert_eq!(format, ImportFormat::PostmanCollection);
+        assert!(!content.is_empty());
+        assert!(status.contains("File Imported API"), "status: {status}");
+        assert_eq!(app.collections.len(), 1);
+        assert_eq!(app.collections[0].name, "File Imported API");
+        assert_eq!(app.collections[0].items.len(), 1);
     }
 }
