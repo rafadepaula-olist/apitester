@@ -553,44 +553,85 @@ pub fn render_modals(ctx: &egui::Context, app: &mut ApiTesterApp) {
     }
 }
 
-/// Opens a non-blocking async file picker inside the Tokio runtime (with `zenity` fallback if portal fails).
+/// Opens a non-blocking async file picker.
+/// On Linux, prefers native `zenity` -> `kdialog` (instant, reliable on Wayland/X11) and only
+/// falls back to `rfd::AsyncFileDialog` if neither is installed.
 async fn pick_import_file_async() -> Result<Option<std::path::PathBuf>, String> {
-    let portal_res = tokio::spawn(async {
+    #[cfg(target_os = "linux")]
+    {
+        match pick_file_via_zenity(false, None).await {
+            Ok(path) => return Ok(path),
+            Err(ZenityError::NotFound) => {}
+            Err(ZenityError::Failed(msg)) => return Err(msg),
+        }
+        match pick_file_via_kdialog(false, None).await {
+            Ok(path) => return Ok(path),
+            Err(ZenityError::NotFound) => {}
+            Err(ZenityError::Failed(msg)) => return Err(msg),
+        }
+    }
+
+    let portal_fut = tokio::spawn(async {
         rfd::AsyncFileDialog::new()
             .add_filter("API Files", &["json", "yaml", "yml", "har", "txt"])
             .pick_file()
             .await
             .map(|h| h.path().to_path_buf())
-    })
-    .await;
+    });
 
-    match portal_res {
-        Ok(path) => Ok(path),
-        Err(_) => pick_file_via_zenity(false, None).await,
+    match tokio::time::timeout(std::time::Duration::from_secs(30), portal_fut).await {
+        Ok(Ok(path)) => Ok(path),
+        Ok(Err(e)) => Err(format!("file dialog failed: {e}")),
+        Err(_) => Err("file dialog timed out; use the File path field instead".into()),
     }
 }
 
-/// Opens a non-blocking async save dialog inside the Tokio runtime and writes `content` to disk.
+/// Opens a non-blocking async save dialog and writes `content` to disk.
 async fn save_export_file_async(
     default_name: &str,
     content: String,
 ) -> Result<Option<std::path::PathBuf>, String> {
-    let name_owned = default_name.to_string();
-    let portal_res = tokio::spawn(async move {
-        rfd::AsyncFileDialog::new()
-            .set_file_name(&name_owned)
-            .save_file()
-            .await
-            .map(|h| h.path().to_path_buf())
-    })
-    .await;
-
-    let chosen = match portal_res {
-        Ok(path) => path,
-        Err(_) => pick_file_via_zenity(true, Some(default_name)).await?,
+    let chosen = {
+        #[cfg(target_os = "linux")]
+        {
+            match pick_file_via_zenity(true, Some(default_name)).await {
+                Ok(path) => Some(path),
+                Err(ZenityError::NotFound) => {
+                    match pick_file_via_kdialog(true, Some(default_name)).await {
+                        Ok(path) => Some(path),
+                        Err(ZenityError::NotFound) => None,
+                        Err(ZenityError::Failed(msg)) => return Err(msg),
+                    }
+                }
+                Err(ZenityError::Failed(msg)) => return Err(msg),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
     };
 
-    if let Some(path) = chosen {
+    let path = match chosen {
+        Some(p) => p,
+        None => {
+            let name_owned = default_name.to_string();
+            let portal_fut = tokio::spawn(async move {
+                rfd::AsyncFileDialog::new()
+                    .set_file_name(&name_owned)
+                    .save_file()
+                    .await
+                    .map(|h| h.path().to_path_buf())
+            });
+            match tokio::time::timeout(std::time::Duration::from_secs(30), portal_fut).await {
+                Ok(Ok(p)) => p,
+                Ok(Err(e)) => return Err(format!("save dialog failed: {e}")),
+                Err(_) => return Err("save dialog timed out".into()),
+            }
+        }
+    };
+
+    if let Some(path) = path {
         tokio::fs::write(&path, content)
             .await
             .map_err(|e| e.to_string())?;
@@ -600,22 +641,72 @@ async fn save_export_file_async(
     }
 }
 
+#[cfg(target_os = "linux")]
+enum ZenityError {
+    NotFound,
+    Failed(String),
+}
+
+#[cfg(target_os = "linux")]
 async fn pick_file_via_zenity(
     save: bool,
     default_name: Option<&str>,
-) -> Result<Option<std::path::PathBuf>, String> {
+) -> Result<Option<std::path::PathBuf>, ZenityError> {
     let mut cmd = tokio::process::Command::new("zenity");
     cmd.arg("--file-selection");
     if save {
-        cmd.arg("--save").arg("--confirm-overwrite");
+        cmd.arg("--save")
+            .arg("--confirm-overwrite")
+            .arg("--title=Save Export");
         if let Some(name) = default_name {
             cmd.arg(format!("--filename={name}"));
         }
+    } else {
+        cmd.arg("--title=Import API Collection")
+            .arg("--file-filter=API Files (*.json *.yaml *.yml *.har *.txt) | *.json *.yaml *.yml *.har *.txt")
+            .arg("--file-filter=All Files | *");
     }
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| format!("desktop portal and zenity unavailable ({e}); use the File path field instead"))?;
+
+    let output = match cmd.output().await {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(ZenityError::NotFound),
+        Err(e) => return Err(ZenityError::Failed(e.to_string())),
+    };
+
+    if output.status.success() {
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if s.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(std::path::PathBuf::from(s)))
+        }
+    } else {
+        // Exit code 1 (or 5) means user cancelled / closed dialog.
+        Ok(None)
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn pick_file_via_kdialog(
+    save: bool,
+    default_name: Option<&str>,
+) -> Result<Option<std::path::PathBuf>, ZenityError> {
+    let mut cmd = tokio::process::Command::new("kdialog");
+    if save {
+        cmd.arg("--getsavefilename")
+            .arg(default_name.unwrap_or("collection.postman_collection.json"));
+    } else {
+        cmd.arg("--getopenfilename")
+            .arg(".")
+            .arg("*.json *.yaml *.yml *.har *.txt|API Files");
+    }
+
+    let output = match cmd.output().await {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(ZenityError::NotFound),
+        Err(e) => return Err(ZenityError::Failed(e.to_string())),
+    };
+
     if output.status.success() {
         let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if s.is_empty() {
