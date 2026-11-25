@@ -4,6 +4,20 @@ A fast, local-first, native Rust API client, collection runner, and load tester 
 
 ![HTTP Workbench Dark](docs/screenshots/01_http_workbench_dark.png)
 
+## Quick Install (Ubuntu / Linux)
+
+Requires the Rust toolchain ([rustup.rs](https://rustup.rs)) and `git` (no `sudo` required):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rafadepaula-olist/apitester/main/install.sh | bash
+```
+
+To uninstall:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rafadepaula-olist/apitester/main/install.sh | bash -s -- --uninstall
+```
+
 ## Features
 
 - **Native GPU-Accelerated GUI (`egui`/`eframe`)**: Multi-tab workbench, Dark & Light themes, color-coded HTTP method/status badges, syntax-highlighted JSON/XML/HTML response viewer with in-response search, and a collapsible Wire Console.

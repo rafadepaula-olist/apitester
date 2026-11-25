@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_URL="https://github.com/rafadepaula-olist/apitester.git"
+SRC_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/apitester-src"
+
 BIN_DIR="$HOME/.local/bin"
 ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
 APP_DIR="$HOME/.local/share/applications"
@@ -31,18 +33,43 @@ fi
 export PATH="$HOME/.cargo/bin:$PATH"
 if ! command -v cargo >/dev/null 2>&1; then
     echo "Error: cargo not found on PATH (checked \$HOME/.cargo/bin as well)." >&2
-    echo "Install Rust from https://rustup.rs and re-run ./install.sh." >&2
+    echo "Install Rust from https://rustup.rs and re-run this installer." >&2
     exit 1
 fi
 
+SCRIPT_PATH="${BASH_SOURCE[0]:-}"
+BUILD_DIR=""
+if [[ -n "$SCRIPT_PATH" && -f "$SCRIPT_PATH" ]]; then
+    CANDIDATE_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+    if [[ -f "$CANDIDATE_DIR/Cargo.toml" && -f "$CANDIDATE_DIR/assets/apitester.svg" ]]; then
+        BUILD_DIR="$CANDIDATE_DIR"
+    fi
+fi
+
+if [[ -z "$BUILD_DIR" ]]; then
+    if ! command -v git >/dev/null 2>&1; then
+        echo "Error: git is required for remote installation. Install git (e.g. 'sudo apt install git') and try again." >&2
+        exit 1
+    fi
+    if [[ -d "$SRC_DIR/.git" ]]; then
+        echo "Updating APITester source in $SRC_DIR..."
+        git -C "$SRC_DIR" pull --ff-only
+    else
+        echo "Cloning APITester into $SRC_DIR..."
+        mkdir -p "$(dirname "$SRC_DIR")"
+        git clone --depth 1 "$REPO_URL" "$SRC_DIR"
+    fi
+    BUILD_DIR="$SRC_DIR"
+fi
+
 echo "Building APITester (release)..."
-(cd "$SCRIPT_DIR" && cargo build --release --bin apitester --bin apitester-cli)
+(cd "$BUILD_DIR" && cargo build --release --bin apitester --bin apitester-cli)
 
 mkdir -p "$BIN_DIR" "$ICON_DIR" "$APP_DIR"
 
-install -m 0755 "$SCRIPT_DIR/target/release/apitester" "$GUI_BIN"
-install -m 0755 "$SCRIPT_DIR/target/release/apitester-cli" "$CLI_BIN"
-install -m 0644 "$SCRIPT_DIR/assets/apitester.svg" "$ICON_DEST"
+install -m 0755 "$BUILD_DIR/target/release/apitester" "$GUI_BIN"
+install -m 0755 "$BUILD_DIR/target/release/apitester-cli" "$CLI_BIN"
+install -m 0644 "$BUILD_DIR/assets/apitester.svg" "$ICON_DEST"
 
 cat > "$DESKTOP_DEST" <<EOF
 [Desktop Entry]
