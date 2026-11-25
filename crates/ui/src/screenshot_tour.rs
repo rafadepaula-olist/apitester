@@ -1,12 +1,12 @@
 use std::path::PathBuf;
 
 use apitester_core::models::ThemeMode;
-use apitester_import_export::{generate_code, CodegenLanguage};
+use apitester_import_export::CodegenLanguage;
 use egui::{Event, ViewportCommand};
 
 use crate::app::ApiTesterApp;
 use crate::state::{
-    ImportFormat, ModalState, RequestSubTab, ResponseSubTab, RunnerModalTab, SidebarTab,
+    AppTab, ImportFormat, RequestSubTab, ResponseSubTab, RunnerModalTab, SidebarTab,
 };
 
 const TOUR_STEPS: &[&str] = &[
@@ -14,10 +14,11 @@ const TOUR_STEPS: &[&str] = &[
     "02_http_workbench_light.png",
     "03_auth_and_scripts.png",
     "04_runner_and_load_tester.png",
-    "05_import_export_codegen.png",
+    "05_code_drawer.png",
     "06_capture_proxy.png",
     "07_realtime_protocols.png",
-    "08_import_export_modal.png",
+    "08_import_export_tab.png",
+    "09_settings_tab.png",
 ];
 
 /// State machine driving automated `--screenshot-tour <dir>` captures.
@@ -57,7 +58,6 @@ impl ScreenshotTour {
             return;
         };
 
-        // Check for arrived screenshot event first.
         let arrived_image = ctx.input(|i| {
             i.events.iter().find_map(|ev| match ev {
                 Event::Screenshot { image, .. } => Some(image.clone()),
@@ -107,7 +107,6 @@ impl ScreenshotTour {
                     tour.wait_frames -= 1;
                     ctx.request_repaint();
                 } else {
-                    // Timed out waiting for backend screenshot; advance to avoid hanging.
                     tour.step += 1;
                     tour.phase = TourPhase::Configure;
                     ctx.request_repaint();
@@ -123,17 +122,17 @@ impl ScreenshotTour {
 }
 
 fn configure_step(app: &mut ApiTesterApp, step: usize) {
-    app.modal = ModalState::None;
     app.sidebar_open = true;
     app.sidebar_tab = SidebarTab::Collections;
     app.console_open = false;
+    app.code_drawer_open = false;
 
     match step {
         0 => {
             // 01_http_workbench_dark.png
             app.settings.theme = ThemeMode::Dark;
             app.active_tab = 0;
-            if let Some(tab) = app.tabs.get_mut(0) {
+            if let Some(tab) = app.tabs.get_mut(0).and_then(AppTab::as_request_mut) {
                 tab.req_sub_tab = RequestSubTab::Params;
                 tab.resp_sub_tab = ResponseSubTab::Body;
             }
@@ -142,7 +141,7 @@ fn configure_step(app: &mut ApiTesterApp, step: usize) {
             // 02_http_workbench_light.png
             app.settings.theme = ThemeMode::Light;
             app.active_tab = 0;
-            if let Some(tab) = app.tabs.get_mut(0) {
+            if let Some(tab) = app.tabs.get_mut(0).and_then(AppTab::as_request_mut) {
                 tab.req_sub_tab = RequestSubTab::Params;
                 tab.resp_sub_tab = ResponseSubTab::Body;
             }
@@ -152,7 +151,7 @@ fn configure_step(app: &mut ApiTesterApp, step: usize) {
             app.settings.theme = ThemeMode::Dark;
             app.active_tab = 0;
             app.console_open = true;
-            if let Some(tab) = app.tabs.get_mut(0) {
+            if let Some(tab) = app.tabs.get_mut(0).and_then(AppTab::as_request_mut) {
                 tab.req_sub_tab = RequestSubTab::Tests;
                 tab.resp_sub_tab = ResponseSubTab::TestResults;
             }
@@ -161,26 +160,19 @@ fn configure_step(app: &mut ApiTesterApp, step: usize) {
             // 04_runner_and_load_tester.png
             app.settings.theme = ThemeMode::Dark;
             app.runner_modal_tab = RunnerModalTab::LoadTester;
-            app.modal = ModalState::RunnerAndLoadTester;
+            app.open_or_focus_runner_tab();
         }
         4 => {
-            // 05_import_export_codegen.png
+            // 05_code_drawer.png — HTTP workbench + live Right Code Snippet Drawer
             app.settings.theme = ThemeMode::Dark;
-            let code = if let Some(tab) = app.tabs.first() {
-                let vars = app.build_variable_context(tab.collection_id);
-                generate_code(&tab.request, CodegenLanguage::RustReqwest, &vars)
-            } else {
-                String::new()
-            };
-            app.modal = ModalState::CodeSnippet {
-                language: CodegenLanguage::RustReqwest,
-                code,
-            };
+            app.active_tab = 0;
+            app.code_drawer_lang = CodegenLanguage::RustReqwest;
+            app.code_drawer_open = true;
         }
         5 => {
             // 06_capture_proxy.png
             app.settings.theme = ThemeMode::Dark;
-            app.modal = ModalState::CaptureProxy;
+            app.open_or_focus_proxy_tab();
         }
         6 => {
             // 07_realtime_protocols.png
@@ -190,21 +182,31 @@ fn configure_step(app: &mut ApiTesterApp, step: usize) {
             }
         }
         7 => {
-            // 08_import_export_modal.png — populate a large multi-hundred-line JSON to verify scroll containment
+            // 08_import_export_tab.png — integrated tab with large JSON
             app.settings.theme = ThemeMode::Dark;
-            app.active_tab = 0;
+            app.open_or_focus_import_tab();
             let large_json = app
                 .collections
                 .first()
                 .and_then(|c| apitester_import_export::export_postman_collection(c).ok())
-                .map(|s| format!("{s}\n{s}\n{s}"))
+                .map(|s| format!("{s}\n{s}"))
                 .unwrap_or_default();
-            app.modal = ModalState::ImportExport {
-                format: ImportFormat::PostmanCollection,
-                file_path: String::new(),
-                input_text: large_json,
-                status: "Ready to import (choose a file, drop one here, or click Import).".into(),
-            };
+            if let Some(AppTab::ImportExport {
+                format,
+                input_text,
+                status,
+                ..
+            }) = app.tabs.get_mut(app.active_tab)
+            {
+                *format = ImportFormat::PostmanCollection;
+                *input_text = large_json;
+                *status = "Ready to import (choose a file, drop one here, or click Import Text).".into();
+            }
+        }
+        8 => {
+            // 09_settings_tab.png
+            app.settings.theme = ThemeMode::Dark;
+            app.open_or_focus_settings_tab();
         }
         _ => {}
     }

@@ -4,7 +4,6 @@ use std::path::PathBuf;
 use apitester_core::models::{
     ConsoleLogEntry, HttpMethod, ProtocolConfig, RequestItem, ResponseData,
 };
-use apitester_import_export::CodegenLanguage;
 use apitester_net::{McpResource, McpTool, MqttClient, ProtoSchema, SocketIoClient, WsClient};
 use apitester_proxy::CapturedExchange;
 use apitester_runner::{
@@ -71,25 +70,38 @@ pub enum LoadProfileKind {
     Peak,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ModalState {
-    None,
+/// Unified Workbench Tab — eliminates floating modal spam by hosting every tool in the tab strip.
+#[allow(clippy::large_enum_variant)]
+pub enum AppTab {
+    Request(Box<WorkbenchTab>),
+    Runner,
     ImportExport {
         format: ImportFormat,
         file_path: String,
         input_text: String,
         status: String,
     },
-    CodeSnippet {
-        language: CodegenLanguage,
-        code: String,
-    },
     CaptureProxy,
-    RunnerAndLoadTester,
     Settings,
-    CollectionEditor {
+    CollectionSettings {
         collection_id: Uuid,
     },
+}
+
+impl AppTab {
+    pub fn as_request(&self) -> Option<&WorkbenchTab> {
+        match self {
+            Self::Request(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    pub fn as_request_mut(&mut self) -> Option<&mut WorkbenchTab> {
+        match self {
+            Self::Request(t) => Some(t),
+            _ => None,
+        }
+    }
 }
 
 /// Direction of a realtime protocol message log entry.
@@ -124,7 +136,7 @@ impl RealtimeLogEntry {
     }
 }
 
-/// State of one open workbench tab (HTTP, GraphQL, WebSocket, gRPC, MQTT, Socket.IO, MCP, SSE).
+/// State of one open request workbench tab (HTTP, GraphQL, WebSocket, gRPC, MQTT, Socket.IO, MCP, SSE).
 pub struct WorkbenchTab {
     pub id: Uuid,
     pub title: String,

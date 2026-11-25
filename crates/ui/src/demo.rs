@@ -11,7 +11,7 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use crate::app::ApiTesterApp;
-use crate::state::{LogDirection, RealtimeLogEntry, WorkbenchTab};
+use crate::state::{AppTab, LogDirection, RealtimeLogEntry, WorkbenchTab};
 
 /// Populates rich, realistic demo data when `--demo` or `--screenshot-tour` is passed.
 pub fn populate_demo_data(app: &mut ApiTesterApp) {
@@ -202,7 +202,11 @@ pub fn populate_demo_data(app: &mut ApiTesterApp) {
         ),
     ];
 
-    app.tabs = vec![tab1, tab2, tab3];
+    app.tabs = vec![
+        AppTab::Request(Box::new(tab1)),
+        AppTab::Request(Box::new(tab2)),
+        AppTab::Request(Box::new(tab3)),
+    ];
     app.active_tab = 0;
 
     app.console_logs = sample_response.console_logs.clone();
