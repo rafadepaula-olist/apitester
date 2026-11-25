@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -39,6 +39,7 @@ use crate::theme::{
     underline_tab, Palette,
 };
 use crate::widgets::auth_editor::auth_editor_ui;
+use crate::widgets::icons::{rail_icon_button, RailIcon};
 use crate::widgets::kv_table::{form_data_table_ui, kv_table_ui, variables_table_ui};
 use crate::widgets::modals::{
     import_from_file_path, render_capture_proxy_tab, render_code_drawer,
@@ -75,10 +76,12 @@ pub struct ApiTesterApp {
 
     pub sidebar_open: bool,
     pub sidebar_tab: SidebarTab,
+    pub collapsed_collections: HashSet<Uuid>,
     pub search_query: String,
     pub reveal_secrets: bool,
     pub console_open: bool,
     pub console_logs: Vec<ConsoleLogEntry>,
+    pub demo_mode: bool,
 
     // Collapsible right live Code Snippet drawer
     pub code_drawer_open: bool,
@@ -131,18 +134,26 @@ impl ApiTesterApp {
 
     /// Creates an `ApiTesterApp` without requiring a GPU/window context (used in unit tests).
     pub fn new_headless(rt: Handle, config: LaunchConfig) -> Self {
-        let data_dir = config.data_dir.unwrap_or_else(|| {
-            dirs::data_local_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("apitester")
-        });
+        let data_dir = if config.demo_mode && config.data_dir.is_none() {
+            std::env::temp_dir().join(format!("apitester_demo_{}", Uuid::new_v4()))
+        } else {
+            config.data_dir.unwrap_or_else(|| {
+                dirs::data_local_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("apitester")
+            })
+        };
 
         let json_store = JsonStore::open(&data_dir).unwrap_or_else(|_| {
             JsonStore::open(std::env::temp_dir().join("apitester_fallback"))
                 .expect("open fallback json store")
         });
-        let sqlite_store = SqliteStore::open(data_dir.join("apitester.sqlite"))
-            .unwrap_or_else(|_| SqliteStore::open_in_memory().expect("open in-memory sqlite"));
+        let sqlite_store = if config.demo_mode {
+            SqliteStore::open_in_memory().expect("open in-memory sqlite for demo")
+        } else {
+            SqliteStore::open(data_dir.join("apitester.sqlite"))
+                .unwrap_or_else(|_| SqliteStore::open_in_memory().expect("open in-memory sqlite"))
+        };
 
         let settings = sqlite_store.load_settings().unwrap_or_default();
         let collections = json_store.list_collections().unwrap_or_default();
@@ -170,10 +181,12 @@ impl ApiTesterApp {
             active_tab: 0,
             sidebar_open: true,
             sidebar_tab: SidebarTab::Collections,
+            collapsed_collections: HashSet::new(),
             search_query: String::new(),
             reveal_secrets: false,
             console_open: false,
             console_logs: Vec::new(),
+            demo_mode: config.demo_mode,
             code_drawer_open: false,
             code_drawer_lang: CodegenLanguage::Curl,
             proxy_port: 8888,
@@ -368,8 +381,20 @@ impl ApiTesterApp {
         }
     }
 
-    /// Flushes any dirty request tabs, all collections, all environments, and settings to disk.
+    pub fn toggle_collection_collapsed(&mut self, collection_id: Uuid) {
+        if !self.collapsed_collections.remove(&collection_id) {
+            self.collapsed_collections.insert(collection_id);
+        }
+    }
+
+    pub fn is_collection_collapsed(&self, collection_id: Uuid) -> bool {
+        self.collapsed_collections.contains(&collection_id)
+    }
+
     pub fn persist_all(&mut self) {
+        if self.demo_mode {
+            return;
+        }
         let dirty_indices: Vec<usize> = self
             .tabs
             .iter()
@@ -1059,7 +1084,7 @@ impl ApiTesterApp {
 
     fn render_activity_rail(&mut self, ctx: &egui::Context, pal: &Palette) {
         SidePanel::left("activity_rail")
-            .exact_width(58.0)
+            .exact_width(82.0)
             .resizable(false)
             .frame(
                 Frame::none()
@@ -1069,15 +1094,16 @@ impl ApiTesterApp {
             )
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
+                    ui.spacing_mut().item_spacing.y = 4.0;
                     let sidebar_items = [
-                        (SidebarTab::Collections, "Col", "Collections"),
-                        (SidebarTab::Environments, "Env", "Environments"),
-                        (SidebarTab::History, "Hist", "History"),
-                        (SidebarTab::Cookies, "Cook", "Cookies"),
+                        (SidebarTab::Collections, RailIcon::Collections, "Collections"),
+                        (SidebarTab::Environments, RailIcon::Environments, "Environments"),
+                        (SidebarTab::History, RailIcon::History, "History"),
+                        (SidebarTab::Cookies, RailIcon::Cookies, "Cookies"),
                     ];
-                    for (tab, short, tip) in sidebar_items {
+                    for (tab, icon, label) in sidebar_items {
                         let active = self.sidebar_open && self.sidebar_tab == tab;
-                        if rail_button(ui, short, active, pal).on_hover_text(tip).clicked() {
+                        if rail_icon_button(ui, icon, label, active, pal).clicked() {
                             if active {
                                 self.sidebar_open = false;
                             } else {
@@ -1092,19 +1118,13 @@ impl ApiTesterApp {
                     ui.add_space(4.0);
 
                     let runner_active = matches!(self.tabs.get(self.active_tab), Some(AppTab::Runner));
-                    if rail_button(ui, "Run", runner_active, pal)
-                        .on_hover_text("Collection Runner & Load Tester")
-                        .clicked()
-                    {
+                    if rail_icon_button(ui, RailIcon::Runner, "Runner", runner_active, pal).clicked() {
                         self.open_or_focus_runner_tab();
                     }
 
                     let proxy_active =
                         matches!(self.tabs.get(self.active_tab), Some(AppTab::CaptureProxy));
-                    if rail_button(ui, "Prx", proxy_active, pal)
-                        .on_hover_text("Local Capture Proxy")
-                        .clicked()
-                    {
+                    if rail_icon_button(ui, RailIcon::Proxy, "Proxy", proxy_active, pal).clicked() {
                         self.open_or_focus_proxy_tab();
                     }
 
@@ -1112,20 +1132,19 @@ impl ApiTesterApp {
                         self.tabs.get(self.active_tab),
                         Some(AppTab::ImportExport { .. })
                     );
-                    if rail_button(ui, "Imp", import_active, pal)
-                        .on_hover_text("Import / Export")
-                        .clicked()
-                    {
+                    if rail_icon_button(ui, RailIcon::Import, "Import", import_active, pal).clicked() {
                         self.open_or_focus_import_tab();
                     }
                 });
 
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-                    let theme_label = if pal.is_dark { "Lit" } else { "Drk" };
-                    if rail_button(ui, theme_label, false, pal)
-                        .on_hover_text("Toggle Dark / Light Theme")
-                        .clicked()
-                    {
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    let (theme_icon, theme_label) = if pal.is_dark {
+                        (RailIcon::Sun, "Light")
+                    } else {
+                        (RailIcon::Moon, "Dark")
+                    };
+                    if rail_icon_button(ui, theme_icon, theme_label, false, pal).clicked() {
                         self.toggle_theme();
                         apply_theme(ctx, self.settings.theme);
                         self.theme_applied = Some(self.settings.theme);
@@ -1133,8 +1152,7 @@ impl ApiTesterApp {
 
                     let settings_active =
                         matches!(self.tabs.get(self.active_tab), Some(AppTab::Settings));
-                    if rail_button(ui, "Set", settings_active, pal)
-                        .on_hover_text("Settings")
+                    if rail_icon_button(ui, RailIcon::Settings, "Settings", settings_active, pal)
                         .clicked()
                     {
                         self.open_or_focus_settings_tab();
@@ -1237,23 +1255,44 @@ impl ApiTesterApp {
             return;
         }
 
+        let mut toggle_col_id: Option<Uuid> = None;
+
         ScrollArea::vertical().id_salt("collections_scroll").show(ui, |ui| {
             for col in &self.collections {
+                let is_open = !self.collapsed_collections.contains(&col.id);
                 ui.horizontal(|ui| {
-                    let header_id = ui.make_persistent_id(col.id);
-                    let state = egui::collapsing_header::CollapsingState::load_with_default_open(
-                        ui.ctx(),
-                        header_id,
-                        true,
+                    let (tri_rect, tri_resp) =
+                        ui.allocate_exact_size(Vec2::new(16.0, 20.0), egui::Sense::click());
+                    let c = tri_rect.center();
+                    let tri_pts = if is_open {
+                        vec![
+                            egui::Pos2::new(c.x - 4.0, c.y - 2.5),
+                            egui::Pos2::new(c.x + 4.0, c.y - 2.5),
+                            egui::Pos2::new(c.x, c.y + 3.5),
+                        ]
+                    } else {
+                        vec![
+                            egui::Pos2::new(c.x - 2.5, c.y - 4.0),
+                            egui::Pos2::new(c.x + 3.5, c.y),
+                            egui::Pos2::new(c.x - 2.5, c.y + 4.0),
+                        ]
+                    };
+                    ui.painter().add(egui::Shape::convex_polygon(
+                        tri_pts,
+                        pal.text_secondary,
+                        Stroke::NONE,
+                    ));
+
+                    let name_resp = ui.add(
+                        egui::Button::new(RichText::new(&col.name).strong().color(pal.text_primary))
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(Stroke::NONE)
+                            .min_size(Vec2::ZERO),
                     );
-                    let is_open = state.is_open();
-                    let arrow = if is_open { "v" } else { ">" };
-                    if ghost_button(ui, arrow, pal).clicked() {
-                        let mut s = state;
-                        s.toggle(ui);
-                        s.store(ui.ctx());
+                    if tri_resp.clicked() || name_resp.clicked() {
+                        toggle_col_id = Some(col.id);
                     }
-                    ui.label(RichText::new(&col.name).strong());
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.menu_button("...", |ui| {
                             if ui.button("+ Add Request").clicked() {
@@ -1280,13 +1319,6 @@ impl ApiTesterApp {
                     });
                 });
 
-                let header_id = ui.make_persistent_id(col.id);
-                let is_open = egui::collapsing_header::CollapsingState::load_with_default_open(
-                    ui.ctx(),
-                    header_id,
-                    true,
-                )
-                .is_open();
                 if is_open {
                     ui.indent(col.id, |ui| {
                         render_collection_nodes(ui, &col.items, col.id, &query, pal, &mut open_req);
@@ -1295,6 +1327,10 @@ impl ApiTesterApp {
                 ui.add_space(4.0);
             }
         });
+
+        if let Some(cid) = toggle_col_id {
+            self.toggle_collection_collapsed(cid);
+        }
 
         if let Some((req, cid)) = open_req {
             self.open_or_focus_request(req, cid);
@@ -2234,34 +2270,6 @@ impl eframe::App for ApiTesterApp {
     }
 }
 
-fn rail_button(ui: &mut Ui, label: &str, active: bool, pal: &Palette) -> egui::Response {
-    let fill = if active {
-        pal.accent_tint
-    } else {
-        Color32::TRANSPARENT
-    };
-    let color = if active {
-        pal.accent_indicator
-    } else {
-        pal.text_secondary
-    };
-    let resp = ui.add(
-        egui::Button::new(RichText::new(label).small().strong().color(color))
-            .fill(fill)
-            .stroke(Stroke::NONE)
-            .rounding(Rounding::same(6.0))
-            .min_size(Vec2::new(46.0, 32.0)),
-    );
-    if active {
-        ui.painter().vline(
-            resp.rect.left() - 2.0,
-            resp.rect.top() + 5.0..=resp.rect.bottom() - 5.0,
-            Stroke::new(2.0_f32, pal.accent_indicator),
-        );
-    }
-    resp
-}
-
 fn render_body_editor(
     ui: &mut Ui,
     tab: &mut WorkbenchTab,
@@ -3073,5 +3081,24 @@ mod tests {
         assert_eq!(reloaded.settings.timeout_ms, 12_500);
         assert_eq!(reloaded.settings.global_variables.len(), 1);
         assert_eq!(reloaded.settings.global_variables[0].value, "globalVal");
+
+        // Verify physical .json files exist on disk in <data_dir>/collections/
+        let on_disk_count = std::fs::read_dir(data_dir.path().join("collections"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+            .count();
+        assert_eq!(on_disk_count, 2);
+    }
+
+    #[test]
+    fn toggle_collection_collapsed_state() {
+        let (mut app, _rt, _dir) = test_app(true);
+        let cid = app.collections[0].id;
+        assert!(!app.is_collection_collapsed(cid));
+        app.toggle_collection_collapsed(cid);
+        assert!(app.is_collection_collapsed(cid));
+        app.toggle_collection_collapsed(cid);
+        assert!(!app.is_collection_collapsed(cid));
     }
 }

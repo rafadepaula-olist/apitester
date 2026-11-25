@@ -34,6 +34,7 @@ impl JsonStore {
     }
 
     pub fn save_collection(&self, collection: &Collection) -> CoreResult<PathBuf> {
+        fs::create_dir_all(self.collections_dir())?;
         let path = self.collection_path(collection.id);
         write_json_atomic(&path, collection)?;
         Ok(path)
@@ -74,6 +75,7 @@ impl JsonStore {
     }
 
     pub fn save_environment(&self, env: &Environment) -> CoreResult<PathBuf> {
+        fs::create_dir_all(self.environments_dir())?;
         let path = self.environment_path(env.id);
         write_json_atomic(&path, env)?;
         Ok(path)
