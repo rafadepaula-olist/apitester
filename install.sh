@@ -62,8 +62,13 @@ if [[ -z "$BUILD_DIR" ]]; then
     BUILD_DIR="$SRC_DIR"
 fi
 
-echo "Building APITester (release)..."
-(cd "$BUILD_DIR" && cargo build --release --bin apitester --bin apitester-cli)
+BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+echo "Building APITester (release, jobs=$BUILD_JOBS)..."
+if command -v nice >/dev/null 2>&1; then
+    (cd "$BUILD_DIR" && nice -n 10 cargo build --release -j "$BUILD_JOBS" --bin apitester --bin apitester-cli)
+else
+    (cd "$BUILD_DIR" && cargo build --release -j "$BUILD_JOBS" --bin apitester --bin apitester-cli)
+fi
 
 mkdir -p "$BIN_DIR" "$ICON_DIR" "$APP_DIR"
 

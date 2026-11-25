@@ -30,6 +30,7 @@ fn parse_args() -> LaunchConfig {
 fn main() -> eframe::Result<()> {
     let config = parse_args();
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .expect("failed to start tokio runtime");
