@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use chrono::Utc;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -22,6 +22,8 @@ use crate::capture::CapturedExchange;
 use crate::error::ProxyError;
 
 const BROADCAST_CAPACITY: usize = 256;
+const MAX_HISTORY_ENTRIES: usize = 1_000;
+const MAX_PROXY_BODY_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 
 /// Local HTTP/HTTPS capture proxy server.
 pub struct CaptureProxyServer {
@@ -37,6 +39,14 @@ impl CaptureProxyServer {
     pub async fn start(
         bind_addr: SocketAddr,
     ) -> Result<(Self, SocketAddr, broadcast::Receiver<CapturedExchange>), ProxyError> {
+        if !bind_addr.ip().is_loopback()
+            && std::env::var("APITESTER_PROXY_ALLOW_NON_LOOPBACK").as_deref() != Ok("1")
+        {
+            return Err(ProxyError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "refusing to bind unauthenticated capture proxy to non-loopback address (set APITESTER_PROXY_ALLOW_NON_LOOPBACK=1 to override)",
+            )));
+        }
         let listener = TcpListener::bind(bind_addr).await?;
         let local_addr = listener.local_addr()?;
 
@@ -150,6 +160,9 @@ struct ProxyState {
 impl ProxyState {
     fn record(&self, exchange: CapturedExchange) {
         if let Ok(mut guard) = self.history.lock() {
+            if guard.len() >= MAX_HISTORY_ENTRIES {
+                guard.remove(0);
+            }
             guard.push(exchange.clone());
         }
         let _ = self.tx.send(exchange);
@@ -229,19 +242,35 @@ async fn handle_http_proxy(
     let full_url = target_uri.to_string();
 
     let (parts, body) = req.into_parts();
-    let req_bytes = match body.collect().await {
+    let req_bytes = match Limited::new(body, MAX_PROXY_BODY_BYTES).collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(err) => {
             return text_response(
-                StatusCode::BAD_REQUEST,
+                StatusCode::PAYLOAD_TOO_LARGE,
                 &format!("failed to read request body: {err}"),
             );
         }
     };
 
+    // Collect any header names nominated in `Connection` so we strip them too (RFC 9110 §7.6.1).
+    let connection_nominated: Vec<String> = parts
+        .headers
+        .get_all(hyper::header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+
     let mut forward_builder = Request::builder().method(method.clone()).uri(target_uri);
     for (name, value) in &parts.headers {
-        if name.as_str().eq_ignore_ascii_case("proxy-connection") {
+        let lower = name.as_str().to_ascii_lowercase();
+        if is_hop_by_hop_header(&lower)
+            || lower == "proxy-authorization"
+            || lower == "content-length"
+            || connection_nominated.iter().any(|c| c == &lower)
+        {
             continue;
         }
         forward_builder = forward_builder.header(name, value);
@@ -271,7 +300,10 @@ async fn handle_http_proxy(
     let response_headers = collect_headers(upstream_resp.headers());
     let resp_headers_map = upstream_resp.headers().clone();
 
-    let resp_bytes = match upstream_resp.into_body().collect().await {
+    let resp_bytes = match Limited::new(upstream_resp.into_body(), MAX_PROXY_BODY_BYTES)
+        .collect()
+        .await
+    {
         Ok(collected) => collected.to_bytes(),
         Err(err) => {
             return text_response(

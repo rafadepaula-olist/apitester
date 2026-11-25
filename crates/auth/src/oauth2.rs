@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::time::Duration;
+use std::fmt;
+use std::time::{Duration, Instant};
 
 use apitester_core::models::auth::{ApiKeyLocation, OAuth2Config};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -13,24 +14,48 @@ use url::Url;
 
 use crate::{AuthApplication, AuthError};
 
+const MAX_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024; // 1 MiB
+const TOKEN_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// PKCE verifier and S256 challenge pair for OAuth 2.0 Authorization Code flow.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PkceChallenge {
     pub verifier: String,
     pub challenge: String,
     pub method: String,
 }
 
+impl fmt::Debug for PkceChallenge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PkceChallenge")
+            .field("verifier", &"[REDACTED]")
+            .field("challenge", &self.challenge)
+            .field("method", &self.method)
+            .finish()
+    }
+}
+
 /// Generated OAuth 2.0 authorization URL along with state and PKCE metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AuthorizationRequest {
     pub url: String,
     pub state: String,
     pub pkce: PkceChallenge,
 }
 
+impl fmt::Debug for AuthorizationRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthorizationRequest")
+            .field("url", &"[REDACTED]")
+            .field("state", &"[REDACTED]")
+            .field("pkce", &self.pkce)
+            .finish()
+    }
+}
+
 /// Standard OAuth 2.0 token endpoint response.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OAuth2TokenResponse {
     pub access_token: String,
     #[serde(default)]
@@ -41,6 +66,63 @@ pub struct OAuth2TokenResponse {
     pub refresh_token: Option<String>,
     #[serde(default)]
     pub scope: Option<String>,
+}
+
+impl fmt::Debug for OAuth2TokenResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OAuth2TokenResponse")
+            .field("access_token", &"[REDACTED]")
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
+fn validate_oauth2_url(raw: &str, label: &str) -> Result<Url, AuthError> {
+    let url = Url::parse(raw).map_err(|e| AuthError::InvalidUrl(e.to_string()))?;
+    match url.scheme() {
+        "https" => Ok(url),
+        "http" => {
+            let is_loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1" | "[::1]"));
+            if is_loopback {
+                Ok(url)
+            } else {
+                Err(AuthError::InvalidUrl(format!(
+                    "{label} must use https:// (http:// is only permitted for localhost/loopback)"
+                )))
+            }
+        }
+        other => Err(AuthError::InvalidUrl(format!(
+            "{label} uses unsupported scheme '{other}' (expected https://)"
+        ))),
+    }
+}
+
+/// Verifies an OAuth 2.0 `state` parameter in constant time to prevent CSRF.
+pub fn verify_oauth2_state(expected: &str, received: Option<&str>) -> Result<(), AuthError> {
+    let Some(got) = received else {
+        return Err(AuthError::OAuth2Callback(
+            "OAuth2 callback missing state parameter".into(),
+        ));
+    };
+    let a = expected.as_bytes();
+    let b = got.as_bytes();
+    let mut diff = a.len() ^ b.len();
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= (x ^ y) as usize;
+    }
+    if diff == 0 {
+        Ok(())
+    } else {
+        Err(AuthError::OAuth2Callback(
+            "OAuth2 callback state mismatch".into(),
+        ))
+    }
 }
 
 /// Parameters captured from an OAuth 2.0 localhost redirect callback.
@@ -111,7 +193,7 @@ pub fn build_authorization_url_with_pkce(
         cfg.state.clone()
     };
 
-    let mut url = Url::parse(&cfg.auth_url).map_err(|e| AuthError::InvalidUrl(e.to_string()))?;
+    let mut url = validate_oauth2_url(&cfg.auth_url, "OAuth2 auth_url")?;
     {
         let mut pairs = url.query_pairs_mut();
         pairs.append_pair("response_type", "code");
@@ -244,44 +326,77 @@ pub async fn listen_oauth2_callback_on_listener(
     listener: TcpListener,
     timeout: Duration,
 ) -> Result<OAuth2CallbackResult, AuthError> {
-    let (mut stream, _) = tokio::time::timeout(timeout, listener.accept())
-        .await
-        .map_err(|_| AuthError::OAuth2Callback("timed out waiting for OAuth2 callback".into()))??;
+    let deadline = Instant::now() + timeout;
 
-    let mut buf = vec![0u8; 8192];
-    let n = tokio::time::timeout(timeout, stream.read(&mut buf))
-        .await
-        .map_err(|_| AuthError::OAuth2Callback("timed out reading OAuth2 callback request".into()))??;
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| AuthError::OAuth2Callback("timed out waiting for OAuth2 callback".into()))?;
 
-    let req_text = String::from_utf8_lossy(&buf[..n]);
-    let request_line = req_text
-        .lines()
-        .next()
-        .ok_or_else(|| AuthError::OAuth2Callback("empty HTTP callback request".into()))?;
-    let target = request_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| AuthError::OAuth2Callback("malformed HTTP callback request line".into()))?;
+        let (mut stream, _) = tokio::time::timeout(remaining, listener.accept())
+            .await
+            .map_err(|_| AuthError::OAuth2Callback("timed out waiting for OAuth2 callback".into()))??;
 
-    let dummy_url = Url::parse(&format!("http://127.0.0.1{target}"))
-        .map_err(|e| AuthError::OAuth2Callback(format!("invalid callback URI: {e}")))?;
-    let params: HashMap<String, String> = dummy_url.query_pairs().into_owned().collect();
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| AuthError::OAuth2Callback("timed out reading OAuth2 callback request".into()))?;
 
-    let body = "<html><body><h3>Authorization complete. You may close this window.</h3></body></html>";
-    let http_resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    let _ = stream.write_all(http_resp.as_bytes()).await;
-    let _ = stream.shutdown().await;
+        let mut buf = vec![0u8; 8192];
+        let n = tokio::time::timeout(remaining, stream.read(&mut buf))
+            .await
+            .map_err(|_| {
+                AuthError::OAuth2Callback("timed out reading OAuth2 callback request".into())
+            })??;
 
-    Ok(OAuth2CallbackResult {
-        code: params.get("code").cloned(),
-        state: params.get("state").cloned(),
-        error: params.get("error").cloned(),
-        error_description: params.get("error_description").cloned(),
-    })
+        if n == 0 {
+            continue;
+        }
+
+        let req_text = String::from_utf8_lossy(&buf[..n]);
+        let Some(request_line) = req_text.lines().next() else {
+            continue;
+        };
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or("");
+        let target = parts.next().unwrap_or("");
+
+        if !method.eq_ignore_ascii_case("GET") || !target.starts_with('/') {
+            let _ = stream
+                .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+            let _ = stream.shutdown().await;
+            continue;
+        }
+
+        // Ignore browser auxiliary requests (e.g. /favicon.ico) while waiting for the real callback.
+        if target == "/favicon.ico" {
+            let _ = stream
+                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+            let _ = stream.shutdown().await;
+            continue;
+        }
+
+        let dummy_url = Url::parse(&format!("http://127.0.0.1{target}"))
+            .map_err(|e| AuthError::OAuth2Callback(format!("invalid callback URI: {e}")))?;
+        let params: HashMap<String, String> = dummy_url.query_pairs().into_owned().collect();
+
+        let body = "<html><body><h3>Authorization complete. You may close this window.</h3></body></html>";
+        let http_resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(http_resp.as_bytes()).await;
+        let _ = stream.shutdown().await;
+
+        return Ok(OAuth2CallbackResult {
+            code: params.get("code").cloned(),
+            state: params.get("state").cloned(),
+            error: params.get("error").cloned(),
+            error_description: params.get("error_description").cloned(),
+        });
+    }
 }
 
 async fn post_token_form(
@@ -293,9 +408,16 @@ async fn post_token_form(
             "OAuth2 token_url must not be empty".into(),
         ));
     }
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(token_url)
+    let validated_url = validate_oauth2_url(token_url, "OAuth2 token_url")?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(TOKEN_CONNECT_TIMEOUT)
+        .timeout(TOKEN_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|e| AuthError::Http(e.to_string()))?;
+
+    let mut resp = client
+        .post(validated_url)
         .header("Accept", "application/json")
         .form(form)
         .send()
@@ -303,14 +425,25 @@ async fn post_token_form(
         .map_err(|e| AuthError::Http(e.to_string()))?;
 
     let status = resp.status();
-    let body = resp
-        .text()
+    let mut raw = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
         .await
-        .map_err(|e| AuthError::Http(e.to_string()))?;
+        .map_err(|e| AuthError::Http(e.to_string()))?
+    {
+        if raw.len().saturating_add(chunk.len()) > MAX_TOKEN_RESPONSE_BYTES {
+            return Err(AuthError::Http(format!(
+                "token endpoint response exceeded {MAX_TOKEN_RESPONSE_BYTES} bytes"
+            )));
+        }
+        raw.extend_from_slice(&chunk);
+    }
+    let body = String::from_utf8_lossy(&raw).into_owned();
 
     if !status.is_success() {
+        let preview: String = body.chars().take(512).collect();
         return Err(AuthError::Http(format!(
-            "token endpoint returned {status}: {body}"
+            "token endpoint returned {status}: {preview}"
         )));
     }
 

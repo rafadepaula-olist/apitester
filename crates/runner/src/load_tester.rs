@@ -140,6 +140,10 @@ pub struct LoadTestSummary {
     pub timeline: Vec<LoadTimelinePoint>,
 }
 
+const MAX_LOAD_VUS: usize = 5_000;
+const MAX_LOAD_DURATION_SECS: u64 = 86_400;
+const MAX_STORED_LATENCIES: usize = 100_000;
+
 #[derive(Default)]
 struct MetricsCollector {
     all_latencies: Vec<f64>,
@@ -152,12 +156,16 @@ struct MetricsCollector {
 
 impl MetricsCollector {
     fn record(&mut self, latency_ms: f64, is_error: bool) {
-        self.all_latencies.push(latency_ms);
+        if self.all_latencies.len() < MAX_STORED_LATENCIES {
+            self.all_latencies.push(latency_ms);
+        }
         self.total_requests += 1;
         if is_error {
             self.error_count += 1;
         }
-        self.bucket_latencies.push(latency_ms);
+        if self.bucket_latencies.len() < MAX_STORED_LATENCIES {
+            self.bucket_latencies.push(latency_ms);
+        }
         self.bucket_requests += 1;
         if is_error {
             self.bucket_errors += 1;
@@ -198,8 +206,8 @@ pub async fn run_load_test(
     config: LoadTestConfig,
     progress_tx: Option<mpsc::UnboundedSender<LoadProgressUpdate>>,
 ) -> LoadTestSummary {
-    let duration_secs = config.duration_secs.max(1);
-    let max_vus = config.profile.max_vus().max(1);
+    let duration_secs = config.duration_secs.clamp(1, MAX_LOAD_DURATION_SECS);
+    let max_vus = config.profile.max_vus().clamp(1, MAX_LOAD_VUS);
 
     let resolver = VariableResolver::new(vars.clone());
     let resolved_auth = resolve_auth_variables(&auth, &resolver);
@@ -212,6 +220,7 @@ pub async fn run_load_test(
         cookies: Vec::new(),
         settings: config.settings.clone(),
     });
+    let shared_client = Arc::new(HttpClient::new());
     let shared_req = Arc::new(request);
     let shared_vars = Arc::new(vars);
     let metrics = Arc::new(Mutex::new(MetricsCollector::default()));
@@ -220,6 +229,7 @@ pub async fn run_load_test(
 
     let mut handles = Vec::with_capacity(max_vus);
     for vu_id in 0..max_vus {
+        let client = Arc::clone(&shared_client);
         let req = Arc::clone(&shared_req);
         let vars = Arc::clone(&shared_vars);
         let opts = Arc::clone(&http_opts);
@@ -229,7 +239,6 @@ pub async fn run_load_test(
         let target = Arc::clone(&target_vus);
 
         handles.push(tokio::spawn(async move {
-            let client = HttpClient::new();
             while !stop.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
                 if vu_id >= target.load(Ordering::Relaxed) {
                     tokio::time::sleep(Duration::from_millis(20)).await;

@@ -4,6 +4,16 @@
   var init = JSON.parse(global.__apitester_init_json);
   delete global.__apitester_init_json;
 
+  var hostLog = global.__host_log;
+  var hostRecordTest = global.__host_record_test;
+  var hostBtoa = global.__host_btoa;
+  var hostAtob = global.__host_atob;
+  var nativeJsonStringify = JSON.stringify;
+  delete global.__host_log;
+  delete global.__host_record_test;
+  delete global.__host_btoa;
+  delete global.__host_atob;
+
   var state = {
     globals: init.globals || {},
     collection_vars: init.collection_vars || {},
@@ -38,18 +48,18 @@
   }
 
   global.console = {
-    log: function () { __host_log("log", formatArgs(arguments)); },
-    info: function () { __host_log("info", formatArgs(arguments)); },
-    warn: function () { __host_log("warn", formatArgs(arguments)); },
-    error: function () { __host_log("error", formatArgs(arguments)); },
+    log: function () { hostLog("log", formatArgs(arguments)); },
+    info: function () { hostLog("info", formatArgs(arguments)); },
+    warn: function () { hostLog("warn", formatArgs(arguments)); },
+    error: function () { hostLog("error", formatArgs(arguments)); },
   };
 
   global.btoa = function (input) {
-    return __host_btoa(String(input));
+    return hostBtoa(String(input));
   };
 
   global.atob = function (input) {
-    return __host_atob(String(input));
+    return hostAtob(String(input));
   };
 
   function hasOwn(obj, key) {
@@ -738,10 +748,10 @@
       var testName = String(name);
       try {
         fn();
-        __host_record_test(testName, true, "");
+        hostRecordTest(testName, true, "");
       } catch (err) {
         var msg = err && err.message ? String(err.message) : String(err);
-        __host_record_test(testName, false, msg);
+        hostRecordTest(testName, false, msg);
       }
     },
     expect: function (actual, message) {
@@ -763,14 +773,19 @@
     setNextRequest: setNextRequest,
   };
 
-  global.__apitester_dump_state = function () {
-    return JSON.stringify({
-      globals: state.globals,
-      collection_vars: state.collection_vars,
-      environment_vars: state.environment_vars,
-      local_vars: state.local_vars,
-      next_request: state.next_request,
-      stop_next_request: state.stop_next_request,
-    });
-  };
+  Object.defineProperty(global, "__apitester_dump_state", {
+    value: function () {
+      return nativeJsonStringify({
+        globals: state.globals,
+        collection_vars: state.collection_vars,
+        environment_vars: state.environment_vars,
+        local_vars: state.local_vars,
+        next_request: state.next_request,
+        stop_next_request: state.stop_next_request,
+      });
+    },
+    writable: false,
+    configurable: false,
+    enumerable: false,
+  });
 })(globalThis);

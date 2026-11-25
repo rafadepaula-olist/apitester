@@ -17,9 +17,25 @@ pub struct SqliteStore {
 impl SqliteStore {
     /// Opens or creates a SQLite database at `path` and initializes the schema.
     pub fn open(path: impl AsRef<Path>) -> CoreResult<Self> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+                }
+            }
+        }
         let conn = Connection::open(path)?;
         let store = Self { conn };
         store.init_schema()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
         Ok(store)
     }
 
@@ -75,11 +91,29 @@ impl SqliteStore {
     // ---- History ----
 
     pub fn insert_history(&self, entry: &HistoryEntry) -> CoreResult<()> {
-        let request_json = serde_json::to_string(&entry.request)?;
+        let mut sanitized_req = entry.request.clone();
+        sanitized_req.auth = sanitized_req.auth.redacted();
+        for h in &mut sanitized_req.headers {
+            if is_sensitive_header(&h.key) {
+                h.value = "[REDACTED]".to_string();
+            }
+        }
+        let request_json = serde_json::to_string(&sanitized_req)?;
         let response_json = entry
             .response
             .as_ref()
-            .map(serde_json::to_string)
+            .map(|resp| {
+                let mut sanitized_resp = resp.clone();
+                for h in &mut sanitized_resp.headers {
+                    if is_sensitive_header(&h.key) {
+                        h.value = "[REDACTED]".to_string();
+                    }
+                }
+                for c in &mut sanitized_resp.cookies {
+                    c.value = "[REDACTED]".to_string();
+                }
+                serde_json::to_string(&sanitized_resp)
+            })
             .transpose()?;
 
         self.conn.execute(
@@ -178,20 +212,32 @@ impl SqliteStore {
     }
 
     pub fn get_cookies_for_domain(&self, domain: &str) -> CoreResult<Vec<Cookie>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT domain, path, name, value, expires, http_only, secure, same_site
-             FROM cookies
-             WHERE LTRIM(LOWER(domain), '.') = LOWER(?1)
-                OR LOWER(?1) LIKE ('%.' || LTRIM(LOWER(domain), '.'))
-             ORDER BY domain, path, name",
-        )?;
-
-        let rows = stmt.query_map(params![domain], decode_cookie_row)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row??);
+        let target = domain.trim().trim_start_matches('.').to_ascii_lowercase();
+        if target.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(out)
+        let now = Utc::now();
+        let all = self.list_cookies()?;
+        let matched = all
+            .into_iter()
+            .filter(|c| {
+                if let Some(exp) = c.expires {
+                    if exp <= now {
+                        return false;
+                    }
+                }
+                let cookie_dom = c.domain.trim().trim_start_matches('.').to_ascii_lowercase();
+                if cookie_dom.is_empty()
+                    || cookie_dom.contains('%')
+                    || cookie_dom.contains('_')
+                    || cookie_dom.chars().any(char::is_whitespace)
+                {
+                    return false;
+                }
+                target == cookie_dom || target.ends_with(&format!(".{cookie_dom}"))
+            })
+            .collect();
+        Ok(matched)
     }
 
     pub fn list_cookies(&self) -> CoreResult<Vec<Cookie>> {
@@ -248,6 +294,13 @@ impl SqliteStore {
             None => Ok(AppSettings::default()),
         }
     }
+}
+
+fn is_sensitive_header(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "authorization" | "proxy-authorization" | "cookie" | "set-cookie" | "x-api-key"
+    )
 }
 
 fn decode_history_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CoreResult<HistoryEntry>> {

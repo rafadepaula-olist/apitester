@@ -145,8 +145,10 @@ impl ApiTesterApp {
         };
 
         let json_store = JsonStore::open(&data_dir).unwrap_or_else(|_| {
-            JsonStore::open(std::env::temp_dir().join("apitester_fallback"))
-                .expect("open fallback json store")
+            JsonStore::open(
+                std::env::temp_dir().join(format!("apitester_fallback_{}", Uuid::new_v4())),
+            )
+            .expect("open fallback json store")
         });
         let sqlite_store = if config.demo_mode {
             SqliteStore::open_in_memory().expect("open in-memory sqlite for demo")
@@ -748,14 +750,15 @@ impl ApiTesterApp {
                             message: format!("Pre-request script error: {err}"),
                             timestamp: Utc::now(),
                         });
+                    } else {
+                        updated_globals = out.updated_globals;
+                        updated_col = out.updated_collection_vars;
+                        updated_env = out.updated_environment_vars;
+                        vars.global = updated_globals.clone();
+                        vars.collection = updated_col.clone();
+                        vars.environment = updated_env.clone();
+                        vars.local = out.updated_local_vars;
                     }
-                    updated_globals = out.updated_globals;
-                    updated_col = out.updated_collection_vars;
-                    updated_env = out.updated_environment_vars;
-                    vars.global = updated_globals.clone();
-                    vars.collection = updated_col.clone();
-                    vars.environment = updated_env.clone();
-                    vars.local = out.updated_local_vars;
                 }
 
                 // 2. Resolve auth inheritance + variable interpolation + apply auth
@@ -1827,10 +1830,12 @@ impl ApiTesterApp {
                                 sync_params_from_url(&tab.request.url, &mut tab.request.params);
                             }
                             if tab.request.url.contains("{{") {
-                                url_resp.on_hover_text(format!(
-                                    "Resolved: {}",
+                                let preview = if self.reveal_secrets {
                                     resolver.resolve(&tab.request.url)
-                                ));
+                                } else {
+                                    resolver.resolve_redacted(&tab.request.url)
+                                };
+                                url_resp.on_hover_text(format!("Resolved: {preview}"));
                             }
                         });
                     });
@@ -2217,13 +2222,18 @@ impl ApiTesterApp {
                 let headers = tab.request.headers.clone();
                 let vars_clone = vars.clone();
                 let tx = self.tx.clone();
+                let settings = self.settings.clone();
                 self.rt.spawn(async move {
+                    let http_opts = HttpRequestOptions {
+                        settings,
+                        ..HttpRequestOptions::default()
+                    };
                     let res = introspect_schema(
                         &HttpClient::new(),
                         &url,
                         &headers,
                         &vars_clone,
-                        &HttpRequestOptions::default(),
+                        &http_opts,
                     )
                     .await
                     .map(|v| serde_json::to_string_pretty(&v).unwrap_or_default())

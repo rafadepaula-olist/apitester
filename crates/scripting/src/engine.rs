@@ -17,6 +17,12 @@ use crate::{ScriptExecutionInput, ScriptExecutionOutput};
 const PRELUDE_JS: &str = include_str!("prelude.js");
 const MAX_MEMORY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_STACK_BYTES: usize = 1024 * 1024;
+const MAX_HOST_LOGS: usize = 1_000;
+const MAX_HOST_TESTS: usize = 1_000;
+const MAX_LOG_MSG_BYTES: usize = 8 * 1024;
+const MAX_TEST_STR_BYTES: usize = 4 * 1024;
+const MAX_TOTAL_HOST_BYTES: usize = 2 * 1024 * 1024;
+const DUMP_STATE_TIMEOUT_MS: u64 = 250;
 
 #[derive(Serialize)]
 struct HeaderPayload<'a> {
@@ -97,6 +103,17 @@ fn build_response_payload(resp: &ResponseData) -> ResponsePayload<'_> {
         headers: enabled_headers(&resp.headers),
         body: resp.body_text().into_owned(),
     }
+}
+
+fn truncate_utf8(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 fn parse_log_level(level: &str) -> ConsoleLogLevel {
@@ -213,6 +230,9 @@ pub fn execute_script(
 
     let logs_ref = Arc::clone(&logs);
     let tests_ref = Arc::clone(&tests);
+    let host_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let host_bytes_log = Arc::clone(&host_bytes);
+    let host_bytes_test = Arc::clone(&host_bytes);
 
     let setup_result: Result<(), String> = context.with(|ctx| {
         let globals = ctx.globals();
@@ -223,9 +243,17 @@ pub fn execute_script(
 
         let log_fn = Function::new(ctx.clone(), move |level: String, message: String| {
             if let Ok(mut guard) = logs_ref.lock() {
+                if guard.len() >= MAX_HOST_LOGS {
+                    return;
+                }
+                let truncated = truncate_utf8(&message, MAX_LOG_MSG_BYTES);
+                let prev = host_bytes_log.fetch_add(truncated.len(), Ordering::Relaxed);
+                if prev.saturating_add(truncated.len()) > MAX_TOTAL_HOST_BYTES {
+                    return;
+                }
                 guard.push(ConsoleLogEntry {
                     level: parse_log_level(&level),
-                    message,
+                    message: truncated,
                     timestamp: Utc::now(),
                 });
             }
@@ -239,6 +267,16 @@ pub fn execute_script(
             ctx.clone(),
             move |name: String, passed: bool, error: String| {
                 if let Ok(mut guard) = tests_ref.lock() {
+                    if guard.len() >= MAX_HOST_TESTS {
+                        return;
+                    }
+                    let name = truncate_utf8(&name, MAX_TEST_STR_BYTES);
+                    let error = truncate_utf8(&error, MAX_TEST_STR_BYTES);
+                    let added = name.len().saturating_add(error.len());
+                    let prev = host_bytes_test.fetch_add(added, Ordering::Relaxed);
+                    if prev.saturating_add(added) > MAX_TOTAL_HOST_BYTES {
+                        return;
+                    }
                     guard.push(TestResult {
                         name,
                         passed,
@@ -304,29 +342,38 @@ pub fn execute_script(
             .map(format_caught_error)
     });
 
-    // Clear interrupt handler before dumping mutated state.
-    runtime.set_interrupt_handler(None);
-
-    if timed_out.load(Ordering::Relaxed) {
+    let is_timed_out = timed_out.load(Ordering::Relaxed);
+    if is_timed_out {
         output.error = Some(format!("Script execution timed out after {timeout_ms}ms"));
     } else if let Some(err) = exec_error {
         output.error = Some(err);
     }
 
-    let dumped: Option<String> = context.with(|ctx| {
-        let dump_fn: Function = ctx.globals().get("__apitester_dump_state").ok()?;
-        dump_fn.call::<(), String>(()).ok()
-    });
+    // Only dump mutated state if the script did not time out, and enforce a strict bounded
+    // interrupt deadline during state extraction so overwritten JS hooks cannot hang the thread.
+    if !is_timed_out {
+        let dump_deadline = Instant::now() + Duration::from_millis(DUMP_STATE_TIMEOUT_MS);
+        runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= dump_deadline)));
 
-    if let Some(json) = dumped {
-        if let Ok(state) = serde_json::from_str::<DumpState>(&json) {
-            output.updated_globals = state.globals;
-            output.updated_collection_vars = state.collection_vars;
-            output.updated_environment_vars = state.environment_vars;
-            output.updated_local_vars = state.local_vars;
-            output.next_request = state.next_request;
-            output.stop_next_request = state.stop_next_request;
+        let dumped: Option<String> = context.with(|ctx| {
+            let dump_fn: Function = ctx.globals().get("__apitester_dump_state").ok()?;
+            dump_fn.call::<(), String>(()).ok()
+        });
+
+        runtime.set_interrupt_handler(None);
+
+        if let Some(json) = dumped {
+            if let Ok(state) = serde_json::from_str::<DumpState>(&json) {
+                output.updated_globals = state.globals;
+                output.updated_collection_vars = state.collection_vars;
+                output.updated_environment_vars = state.environment_vars;
+                output.updated_local_vars = state.local_vars;
+                output.next_request = state.next_request;
+                output.stop_next_request = state.stop_next_request;
+            }
         }
+    } else {
+        runtime.set_interrupt_handler(None);
     }
 
     if let Ok(mut guard) = logs.lock() {

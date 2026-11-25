@@ -886,3 +886,55 @@ fn codegen_all_six_languages_resolve_variables_and_auth() {
     assert!(php.contains(expected_url));
     assert!(php.contains("CURLOPT_POSTFIELDS"));
 }
+
+#[test]
+fn security_codegen_and_openapi_hardening() {
+    let vars = VariableContext::new();
+
+    // 1. Unsafe custom HTTP method must be shell-quoted in cURL export.
+    let mut bad_method = RequestItem::new("Bad", HttpMethod::Custom("POST; id".into()), "https://example.com");
+    bad_method.body = RequestBody::FormData(vec![FormField::text("note", "@secret.txt")]);
+    let curl = export_curl(&bad_method, &vars);
+    assert!(curl.starts_with("curl -X 'POST; id' 'https://example.com'"));
+    assert!(curl.contains("--form-string 'note=@secret.txt'"));
+
+    // 2. Binary path containing `*/` must not break out of JS block comment.
+    let mut bin_req = RequestItem::new("Bin", HttpMethod::Post, "https://example.com");
+    bin_req.body = RequestBody::Binary {
+        path: "foo*/ alert(1) /*bar".into(),
+    };
+    let js = generate_code(&bin_req, CodegenLanguage::JavaScriptFetch, &vars);
+    assert!(!js.contains("foo*/ alert(1)"));
+
+    // 3. Cyclic $ref schema in OpenAPI must terminate cleanly without OOM/panic.
+    let cyclic_openapi = r##"{
+        "openapi": "3.0.0",
+        "info": { "title": "Cyclic", "version": "1.0" },
+        "paths": {
+            "/node": {
+                "post": {
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/Node" }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "components": {
+            "schemas": {
+                "Node": {
+                    "type": "object",
+                    "properties": {
+                        "a": { "$ref": "#/components/schemas/Node" },
+                        "b": { "$ref": "#/components/schemas/Node" }
+                    }
+                }
+            }
+        }
+    }"##;
+    let col = import_openapi(cyclic_openapi).expect("cyclic openapi should not fail");
+    assert_eq!(col.items.len(), 1);
+}

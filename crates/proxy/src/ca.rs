@@ -45,7 +45,7 @@ impl CertificateAuthority {
     /// Generates a new self-signed root CA with the given common name.
     pub fn generate(common_name: &str) -> Result<Self, ProxyError> {
         let mut params = CertificateParams::default();
-        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
         params.key_usages = vec![
             KeyUsagePurpose::KeyCertSign,
             KeyUsagePurpose::CrlSign,
@@ -94,10 +94,31 @@ impl CertificateAuthority {
         if let Some(parent) = key_path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+                }
             }
         }
         std::fs::write(cert_path, &self.cert_pem)?;
-        std::fs::write(key_path, &self.key_pem)?;
+        {
+            use std::io::Write;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut file = opts.open(key_path)?;
+            file.write_all(self.key_pem.as_bytes())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+            }
+        }
         Ok(())
     }
 

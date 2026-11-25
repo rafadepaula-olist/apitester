@@ -25,6 +25,11 @@ pub fn apply_jwt(cfg: &JwtConfig) -> Result<AuthApplication, AuthError> {
     } else {
         cfg.secret.as_bytes().to_vec()
     };
+    if secret_bytes.is_empty() {
+        return Err(AuthError::InvalidConfig(
+            "JWT secret must not be empty".into(),
+        ));
+    }
 
     let mut header_obj = Map::new();
     header_obj.insert("alg".into(), Value::String(alg.to_string()));
@@ -40,7 +45,9 @@ pub fn apply_jwt(cfg: &JwtConfig) -> Result<AuthApplication, AuthError> {
                 AuthError::InvalidConfig("JWT custom_headers must be a JSON object".into())
             })?;
             for (k, v) in obj {
-                header_obj.insert(k.clone(), v.clone());
+                if !k.eq_ignore_ascii_case("alg") {
+                    header_obj.insert(k.clone(), v.clone());
+                }
             }
         }
     }

@@ -26,7 +26,7 @@ pub fn import_curl(cmd: &str) -> ImportExportResult<RequestItem> {
     let mut method: Option<HttpMethod> = None;
     let mut url: Option<String> = None;
     let mut headers: Vec<KeyValue> = Vec::new();
-    let mut data_parts: Vec<String> = Vec::new();
+    let mut data_parts: Vec<(String, bool)> = Vec::new();
     let mut urlencoded_parts: Vec<KeyValue> = Vec::new();
     let mut form_fields: Vec<FormField> = Vec::new();
     let mut auth = AuthConfig::Inherit;
@@ -41,7 +41,7 @@ pub fn import_curl(cmd: &str) -> ImportExportResult<RequestItem> {
                     method = Some(HttpMethod::from_str(inline_val).unwrap_or(HttpMethod::Get));
                 }
                 "-H" => push_header(&mut headers, inline_val),
-                "-d" => data_parts.push(inline_val.to_string()),
+                "-d" => data_parts.push((inline_val.to_string(), true)),
                 "-F" => push_form_field(&mut form_fields, inline_val),
                 "-u" => auth = parse_basic_auth(inline_val),
                 "-A" => headers.push(KeyValue::new("User-Agent", inline_val)),
@@ -62,9 +62,13 @@ pub fn import_curl(cmd: &str) -> ImportExportResult<RequestItem> {
                 let val = next_arg(&tokens, &mut idx, tok)?;
                 push_header(&mut headers, val);
             }
-            "-d" | "--data" | "--data-raw" | "--data-binary" | "--data-ascii" => {
+            "-d" | "--data" | "--data-binary" | "--data-ascii" => {
                 let val = next_arg(&tokens, &mut idx, tok)?;
-                data_parts.push(val.to_string());
+                data_parts.push((val.to_string(), true));
+            }
+            "--data-raw" => {
+                let val = next_arg(&tokens, &mut idx, tok)?;
+                data_parts.push((val.to_string(), false));
             }
             "--data-urlencode" => {
                 let val = next_arg(&tokens, &mut idx, tok)?;
@@ -74,9 +78,14 @@ pub fn import_curl(cmd: &str) -> ImportExportResult<RequestItem> {
                 };
                 urlencoded_parts.push(KeyValue::new(k, v));
             }
-            "-F" | "--form" | "--form-string" => {
+            "-F" | "--form" => {
                 let val = next_arg(&tokens, &mut idx, tok)?;
                 push_form_field(&mut form_fields, val);
+            }
+            "--form-string" => {
+                let val = next_arg(&tokens, &mut idx, tok)?;
+                let (k, v) = val.split_once('=').unwrap_or((val, ""));
+                form_fields.push(FormField::text(k, v));
             }
             "-u" | "--user" => {
                 let val = next_arg(&tokens, &mut idx, tok)?;
@@ -120,14 +129,21 @@ pub fn import_curl(cmd: &str) -> ImportExportResult<RequestItem> {
                             method = Some(HttpMethod::from_str(val).unwrap_or(HttpMethod::Get));
                         }
                         "--header" => push_header(&mut headers, val),
-                        "--data" | "--data-raw" | "--data-binary" | "--data-ascii" => {
-                            data_parts.push(val.to_string());
+                        "--data" | "--data-binary" | "--data-ascii" => {
+                            data_parts.push((val.to_string(), true));
+                        }
+                        "--data-raw" => {
+                            data_parts.push((val.to_string(), false));
                         }
                         "--data-urlencode" => {
                             let (k, v) = val.split_once('=').unwrap_or((val, ""));
                             urlencoded_parts.push(KeyValue::new(k, v));
                         }
                         "--form" => push_form_field(&mut form_fields, val),
+                        "--form-string" => {
+                            let (k, v) = val.split_once('=').unwrap_or((val, ""));
+                            form_fields.push(FormField::text(k, v));
+                        }
                         "--user" => auth = parse_basic_auth(val),
                         "--user-agent" => headers.push(KeyValue::new("User-Agent", val)),
                         "--cookie" => headers.push(KeyValue::new("Cookie", val)),
@@ -178,7 +194,7 @@ pub fn import_curl(cmd: &str) -> ImportExportResult<RequestItem> {
         .map(|h| h.value.as_str());
 
     let body = if force_get {
-        for part in data_parts {
+        for (part, _) in data_parts {
             for pair in part.split('&') {
                 if let Some((k, v)) = pair.split_once('=') {
                     params.push(KeyValue::new(k, v));
@@ -194,7 +210,12 @@ pub fn import_curl(cmd: &str) -> ImportExportResult<RequestItem> {
     } else if !urlencoded_parts.is_empty() && data_parts.is_empty() {
         RequestBody::UrlEncoded(urlencoded_parts)
     } else if !data_parts.is_empty() {
-        let joined = data_parts.join("&");
+        let allow_at_file = data_parts.len() == 1 && data_parts[0].1;
+        let joined = data_parts
+            .iter()
+            .map(|(s, _)| s.as_str())
+            .collect::<Vec<_>>()
+            .join("&");
         let is_form_ct = content_type
             .is_some_and(|ct| ct.to_ascii_lowercase().contains("application/x-www-form-urlencoded"));
         if is_form_ct {
@@ -208,7 +229,7 @@ pub fn import_curl(cmd: &str) -> ImportExportResult<RequestItem> {
                 .collect();
             kvs.extend(urlencoded_parts);
             RequestBody::UrlEncoded(kvs)
-        } else if data_parts.len() == 1 && joined.starts_with('@') && joined.len() > 1 {
+        } else if allow_at_file && joined.starts_with('@') && joined.len() > 1 {
             RequestBody::Binary {
                 path: joined[1..].to_string(),
             }
@@ -240,9 +261,19 @@ pub fn import_curl(cmd: &str) -> ImportExportResult<RequestItem> {
 /// Exports a `RequestItem` as a cURL command string, resolving variables from `vars`.
 pub fn export_curl(req: &RequestItem, vars: &VariableContext) -> String {
     let resolved = ResolvedRequest::from_request(req, vars);
+    let method_arg = if !resolved.method.is_empty()
+        && resolved
+            .method
+            .bytes()
+            .all(|b| b.is_ascii_alphabetic() || b == b'-')
+    {
+        resolved.method.clone()
+    } else {
+        shell_quote(&resolved.method)
+    };
     let mut parts: Vec<String> = vec![format!(
         "curl -X {} {}",
-        resolved.method,
+        method_arg,
         shell_quote(&resolved.url)
     )];
 
@@ -269,14 +300,19 @@ pub fn export_curl(req: &RequestItem, vars: &VariableContext) -> String {
         }
         RequestBody::FormData(fields) => {
             for field in fields {
-                let arg = match &field.kind {
-                    FormFieldKind::Text { value } => format!("{}={}", field.key, value),
-                    FormFieldKind::File { path, content_type } => match content_type {
-                        Some(ct) if !ct.is_empty() => format!("{}=@{};type={}", field.key, path, ct),
-                        _ => format!("{}=@{}", field.key, path),
-                    },
-                };
-                parts.push(format!("-F {}", shell_quote(&arg)));
+                match &field.kind {
+                    FormFieldKind::Text { value } => {
+                        let arg = format!("{}={}", field.key, value);
+                        parts.push(format!("--form-string {}", shell_quote(&arg)));
+                    }
+                    FormFieldKind::File { path, content_type } => {
+                        let arg = match content_type {
+                            Some(ct) if !ct.is_empty() => format!("{}=@{};type={}", field.key, path, ct),
+                            _ => format!("{}=@{}", field.key, path),
+                        };
+                        parts.push(format!("-F {}", shell_quote(&arg)));
+                    }
+                }
             }
         }
         RequestBody::Binary { path } => {

@@ -417,4 +417,20 @@ mod tests {
             Some("val")
         );
     }
+
+    #[test]
+    fn dump_state_cannot_be_overwritten_and_host_logs_are_bounded() {
+        let input = ScriptExecutionInput::default();
+        let code = r#"
+            try {
+                globalThis.__apitester_dump_state = function() { while (true) {} };
+            } catch (_) {}
+            for (var i = 0; i < 1500; i++) {
+                console.log("msg-" + i);
+            }
+        "#;
+        let out = run_script(code, input, 1000);
+        assert_eq!(out.error, None);
+        assert!(out.console_logs.len() <= 1_000);
+    }
 }

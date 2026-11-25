@@ -97,16 +97,26 @@ impl HttpClient {
         ));
 
         let client = self.client_for(&url, &opts.settings)?;
-        let headers = build_headers(req, &resolver, &opts.extra_headers, &opts.cookies)?;
+        let headers = build_headers(&url, req, &resolver, &opts.extra_headers, &opts.cookies)?;
         for (name, val) in &headers {
+            let display_val = if is_sensitive_header_name(name.as_str()) {
+                "[REDACTED]"
+            } else {
+                val.to_str().unwrap_or("<binary>")
+            };
             logs.push(log_entry(
                 ConsoleLogLevel::Log,
-                format!("> {}: {}", name, val.to_str().unwrap_or("<binary>")),
+                format!("> {}: {}", name, display_val),
             ));
         }
 
-        // Measure DNS resolution time when host is a domain name.
-        let dns_ms = measure_dns_ms(&url).await;
+        // Measure DNS resolution time only when not routing through a proxy (prevents DNS leaks).
+        let proxy_active = build_proxy(&opts.settings.proxy, &url)?.is_some();
+        let dns_ms = if proxy_active {
+            0.0
+        } else {
+            measure_dns_ms(&url).await
+        };
 
         let mut builder = client.request(method, url.clone()).headers(headers.clone());
         builder = apply_body(builder, &req.body, &resolver, &headers).await?;
@@ -139,9 +149,14 @@ impl HttpClient {
 
         for (name, value) in response.headers() {
             let val_str = value.to_str().unwrap_or("").to_string();
+            let display_val = if is_sensitive_header_name(name.as_str()) {
+                "[REDACTED]"
+            } else {
+                val_str.as_str()
+            };
             logs.push(log_entry(
                 ConsoleLogLevel::Log,
-                format!("< {}: {}", name, val_str),
+                format!("< {}: {}", name, display_val),
             ));
             if name.as_str().eq_ignore_ascii_case("set-cookie") {
                 if let Some(cookie) = parse_set_cookie(&val_str, &host_for_cookies) {
@@ -190,7 +205,7 @@ impl HttpClient {
             .map_err(|_| NetError::InvalidMethod(req.method.as_str().to_string()))?;
 
         let client = self.client_for(&url, &opts.settings)?;
-        let mut headers = build_headers(req, &resolver, &opts.extra_headers, &opts.cookies)?;
+        let mut headers = build_headers(&url, req, &resolver, &opts.extra_headers, &opts.cookies)?;
         if !headers.contains_key("accept") {
             headers.insert("accept", HeaderValue::from_static("text/event-stream"));
         }
@@ -207,10 +222,22 @@ impl HttpClient {
             let mut current = SseEvent::default();
             let mut has_data = false;
 
+            const MAX_SSE_BUFFER_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+
             while let Some(chunk_res) = stream.next().await {
                 match chunk_res {
                     Ok(chunk) => {
-                        buffer.push_str(&String::from_utf8_lossy(&chunk));
+                        let chunk_text = String::from_utf8_lossy(&chunk);
+                        if buffer.len().saturating_add(chunk_text.len()) > MAX_SSE_BUFFER_BYTES {
+                            let _ = tx
+                                .send(Err(NetError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "SSE stream exceeded 4 MiB line buffer limit",
+                                ))))
+                                .await;
+                            return;
+                        }
+                        buffer.push_str(&chunk_text);
                         while let Some(newline_idx) = buffer.find('\n') {
                             let mut line = buffer[..newline_idx].to_string();
                             buffer.drain(..=newline_idx);
@@ -298,6 +325,7 @@ fn build_resolved_url(
 }
 
 fn build_headers(
+    url: &Url,
     req: &RequestItem,
     resolver: &VariableResolver,
     extra_headers: &[(String, String)],
@@ -319,15 +347,74 @@ fn build_headers(
     }
 
     if !cookies.is_empty() && !map.contains_key(COOKIE) {
-        let cookie_header = cookies
+        let now = Utc::now();
+        let req_host = url.host_str().unwrap_or("").to_ascii_lowercase();
+        let req_path = url.path();
+        let is_https = url.scheme().eq_ignore_ascii_case("https");
+
+        let matching: Vec<String> = cookies
             .iter()
+            .filter(|c| cookie_matches_request(c, &req_host, req_path, is_https, now))
             .map(|c| format!("{}={}", c.name, c.value))
-            .collect::<Vec<_>>()
-            .join("; ");
-        insert_header(&mut map, "cookie", &cookie_header)?;
+            .collect();
+
+        if !matching.is_empty() {
+            insert_header(&mut map, "cookie", &matching.join("; "))?;
+        }
     }
 
     Ok(map)
+}
+
+fn cookie_matches_request(
+    cookie: &Cookie,
+    req_host: &str,
+    req_path: &str,
+    is_https: bool,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    if cookie.secure && !is_https {
+        return false;
+    }
+    if let Some(exp) = cookie.expires {
+        if exp <= now {
+            return false;
+        }
+    }
+    let cookie_dom = cookie
+        .domain
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    if !cookie_dom.is_empty() && !req_host.is_empty() {
+        let domain_ok =
+            req_host == cookie_dom || req_host.ends_with(&format!(".{cookie_dom}"));
+        if !domain_ok {
+            return false;
+        }
+    }
+    let cookie_path = if cookie.path.is_empty() {
+        "/"
+    } else {
+        cookie.path.as_str()
+    };
+    if cookie_path != "/" {
+        let path_ok = req_path == cookie_path
+            || (req_path.starts_with(cookie_path)
+                && (cookie_path.ends_with('/')
+                    || req_path.as_bytes().get(cookie_path.len()) == Some(&b'/')));
+        if !path_ok {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_sensitive_header_name(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "authorization" | "proxy-authorization" | "cookie" | "set-cookie" | "x-api-key"
+    )
 }
 
 fn insert_header(map: &mut HeaderMap, name: &str, value: &str) -> NetResult<()> {
@@ -366,12 +453,38 @@ fn build_reqwest_client(url: &Url, settings: &AppSettings) -> NetResult<reqwest:
         builder = builder.proxy(proxy);
     }
 
+    let mut has_client_cert = false;
     if let Some(host) = url.host_str() {
         for cert_cfg in &settings.client_certs {
             if cert_cfg.enabled && cert_matches_host(cert_cfg, host) {
                 builder = apply_client_cert(builder, cert_cfg)?;
+                has_client_cert = true;
             }
         }
+    }
+    // Prevent presenting an mTLS client certificate to a different origin via redirect.
+    if has_client_cert && settings.follow_redirects {
+        let orig_scheme = url.scheme().to_ascii_lowercase();
+        let orig_host = url.host_str().unwrap_or("").to_ascii_lowercase();
+        let orig_port = url.port_or_known_default();
+        let max_redirects = settings.max_redirects as usize;
+        builder = builder.redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= max_redirects {
+                return attempt.stop();
+            }
+            let next = attempt.url();
+            let same_origin = next.scheme().eq_ignore_ascii_case(&orig_scheme)
+                && next
+                    .host_str()
+                    .map(|h| h.eq_ignore_ascii_case(&orig_host))
+                    .unwrap_or(false)
+                && next.port_or_known_default() == orig_port;
+            if same_origin {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }));
     }
 
     Ok(builder.build()?)
@@ -404,11 +517,20 @@ fn build_proxy(cfg: &ProxyConfig, url: &Url) -> NetResult<Option<Proxy>> {
 }
 
 fn cert_matches_host(cfg: &ClientCertConfig, host: &str) -> bool {
-    cfg.host.eq_ignore_ascii_case(host)
-        || (cfg.host.starts_with("*.")
-            && host
-                .to_ascii_lowercase()
-                .ends_with(&cfg.host[1..].to_ascii_lowercase()))
+    if cfg.host.eq_ignore_ascii_case(host) {
+        return true;
+    }
+    if let Some(suffix) = cfg.host.strip_prefix("*.") {
+        if suffix.is_empty() || !suffix.contains('.') {
+            return false;
+        }
+        let host_lower = host.to_ascii_lowercase();
+        let dot_suffix = format!(".{}", suffix.to_ascii_lowercase());
+        if let Some(prefix) = host_lower.strip_suffix(&dot_suffix) {
+            return !prefix.is_empty() && !prefix.contains('.');
+        }
+    }
+    false
 }
 
 fn apply_client_cert(
@@ -479,7 +601,7 @@ async fn apply_body(
                     }
                     FormFieldKind::File { path, content_type } => {
                         let resolved_path = resolver.resolve(path);
-                        let bytes = tokio::fs::read(&resolved_path).await?;
+                        let bytes = read_regular_file_bounded(&resolved_path).await?;
                         let filename = Path::new(&resolved_path)
                             .file_name()
                             .and_then(|n| n.to_str())
@@ -502,7 +624,7 @@ async fn apply_body(
         }
         RequestBody::Binary { path } => {
             let resolved_path = resolver.resolve(path);
-            let bytes = tokio::fs::read(&resolved_path).await?;
+            let bytes = read_regular_file_bounded(&resolved_path).await?;
             if !has_content_type {
                 builder = builder.header(CONTENT_TYPE, "application/octet-stream");
             }
@@ -525,6 +647,25 @@ async fn apply_body(
     }
 
     Ok(builder)
+}
+
+const MAX_UPLOAD_FILE_BYTES: u64 = 100 * 1024 * 1024; // 100 MiB
+
+async fn read_regular_file_bounded(path: &str) -> NetResult<Vec<u8>> {
+    let meta = tokio::fs::metadata(path).await?;
+    if !meta.is_file() {
+        return Err(NetError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to read non-regular file: {path}"),
+        )));
+    }
+    if meta.len() > MAX_UPLOAD_FILE_BYTES {
+        return Err(NetError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file exceeds maximum size of {MAX_UPLOAD_FILE_BYTES} bytes: {path}"),
+        )));
+    }
+    Ok(tokio::fs::read(path).await?)
 }
 
 async fn measure_dns_ms(url: &Url) -> f64 {
@@ -560,9 +701,31 @@ fn parse_set_cookie(header: &str, default_domain: &str) -> Option<Cookie> {
         let attr = attr.trim();
         if let Some((k, v)) = attr.split_once('=') {
             match k.trim().to_ascii_lowercase().as_str() {
-                "domain" => cookie.domain = v.trim().to_string(),
+                "domain" => {
+                    let claimed = v.trim().trim_start_matches('.').to_ascii_lowercase();
+                    let origin = default_domain.trim().trim_start_matches('.').to_ascii_lowercase();
+                    // Per RFC 6265 §5.3, reject cookies claiming a domain unrelated to the origin host.
+                    let domain_allowed = !claimed.is_empty()
+                        && (origin.is_empty()
+                            || origin == claimed
+                            || origin.ends_with(&format!(".{claimed}")));
+                    if !domain_allowed {
+                        return None;
+                    }
+                    cookie.domain = v.trim().to_string();
+                }
                 "path" => cookie.path = v.trim().to_string(),
                 "samesite" => cookie.same_site = Some(v.trim().to_string()),
+                "max-age" => {
+                    if let Ok(secs) = v.trim().parse::<i64>() {
+                        cookie.expires = Some(Utc::now() + chrono::Duration::seconds(secs));
+                    }
+                }
+                "expires" => {
+                    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(v.trim()) {
+                        cookie.expires = Some(dt.with_timezone(&Utc));
+                    }
+                }
                 _ => {}
             }
         } else {

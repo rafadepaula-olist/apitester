@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use chrono::Utc;
 use rand::distributions::Alphanumeric;
@@ -6,6 +7,9 @@ use rand::Rng;
 use uuid::Uuid;
 
 use crate::models::{KeyValue, Variable};
+
+/// Maximum byte length allowed during variable interpolation to prevent exponential expansion DoS.
+const MAX_RESOLVED_BYTES: usize = 2 * 1024 * 1024; // 2 MiB
 
 /// Variable resolution scopes ordered from lowest to highest precedence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -20,13 +24,46 @@ pub enum VariableScope {
 /// Holds variables across all 5 Postman-compatible scopes.
 ///
 /// Precedence (highest to lowest): `Local > Data > Environment > Collection > Global`.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct VariableContext {
     pub global: HashMap<String, String>,
     pub collection: HashMap<String, String>,
     pub environment: HashMap<String, String>,
     pub data: HashMap<String, String>,
     pub local: HashMap<String, String>,
+    /// Keys that were loaded from `Variable { secret: true }` entries.
+    pub secret_keys: HashSet<String>,
+}
+
+impl fmt::Debug for VariableContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn redact_map<'a>(
+            m: &'a HashMap<String, String>,
+            secrets: &HashSet<String>,
+        ) -> HashMap<&'a str, &'a str> {
+            m.iter()
+                .map(|(k, v)| {
+                    let display = if secrets.contains(k) {
+                        "[REDACTED]"
+                    } else {
+                        v.as_str()
+                    };
+                    (k.as_str(), display)
+                })
+                .collect()
+        }
+        f.debug_struct("VariableContext")
+            .field("global", &redact_map(&self.global, &self.secret_keys))
+            .field("collection", &redact_map(&self.collection, &self.secret_keys))
+            .field(
+                "environment",
+                &redact_map(&self.environment, &self.secret_keys),
+            )
+            .field("data", &redact_map(&self.data, &self.secret_keys))
+            .field("local", &redact_map(&self.local, &self.secret_keys))
+            .field("secret_keys", &self.secret_keys)
+            .finish()
+    }
 }
 
 impl VariableContext {
@@ -44,11 +81,42 @@ impl VariableContext {
 
     /// Loads only `enabled == true` variables into the given scope.
     pub fn load_variables(&mut self, scope: VariableScope, variables: &[Variable]) {
-        let map = self.scope_map_mut(scope);
         for var in variables {
             if var.enabled && !var.key.is_empty() {
-                map.insert(var.key.clone(), var.value.clone());
+                if var.secret {
+                    self.secret_keys.insert(var.key.clone());
+                }
+                self.scope_map_mut(scope)
+                    .insert(var.key.clone(), var.value.clone());
             }
+        }
+    }
+
+    /// Returns `true` if `key` is marked as a secret variable.
+    pub fn is_secret(&self, key: &str) -> bool {
+        self.secret_keys.contains(key)
+    }
+
+    /// Returns a clone of this context with all `secret_keys` replaced by `"[REDACTED]"`.
+    pub fn redacted_clone(&self) -> Self {
+        let redact = |m: &HashMap<String, String>| -> HashMap<String, String> {
+            m.iter()
+                .map(|(k, v)| {
+                    if self.secret_keys.contains(k) {
+                        (k.clone(), "[REDACTED]".to_string())
+                    } else {
+                        (k.clone(), v.clone())
+                    }
+                })
+                .collect()
+        };
+        Self {
+            global: redact(&self.global),
+            collection: redact(&self.collection),
+            environment: redact(&self.environment),
+            data: redact(&self.data),
+            local: redact(&self.local),
+            secret_keys: self.secret_keys.clone(),
         }
     }
 
@@ -108,19 +176,25 @@ impl VariableResolver {
     }
 
     /// Resolves all `{{variable}}` placeholders in `input`, including nested references
-    /// up to `max_depth` passes to prevent infinite cycles.
+    /// up to `max_depth` passes and `MAX_RESOLVED_BYTES` total output size.
     ///
     /// Unknown placeholders are preserved unchanged.
     pub fn resolve(&self, input: &str) -> String {
         let mut current = input.to_string();
         for _ in 0..self.max_depth {
-            let (next, changed) = self.resolve_once(&current);
-            if !changed {
+            let (next, changed, limit_hit) = self.resolve_once(&current);
+            if !changed || limit_hit {
                 return next;
             }
             current = next;
         }
         current
+    }
+
+    /// Resolves placeholders while replacing any `secret_keys` variable with `"[REDACTED]"`.
+    pub fn resolve_redacted(&self, input: &str) -> String {
+        let redacted_resolver = Self::new(self.context.redacted_clone());
+        redacted_resolver.resolve(input)
     }
 
     /// Resolves keys and values for all entries in a `KeyValue` slice.
@@ -136,41 +210,62 @@ impl VariableResolver {
             .collect()
     }
 
-    fn resolve_once(&self, input: &str) -> (String, bool) {
-        let mut out = String::with_capacity(input.len());
+    fn resolve_once(&self, input: &str) -> (String, bool, bool) {
+        let mut out = String::with_capacity(input.len().min(MAX_RESOLVED_BYTES));
         let mut rest = input;
         let mut changed = false;
 
         while let Some(start) = rest.find("{{") {
-            out.push_str(&rest[..start]);
+            let prefix = &rest[..start];
+            if out.len().saturating_add(prefix.len()) > MAX_RESOLVED_BYTES {
+                return (out, changed, true);
+            }
+            out.push_str(prefix);
             let after_open = &rest[start + 2..];
 
             if let Some(end) = after_open.find("}}") {
                 let key = &after_open[..end];
                 // Avoid eating nested `{{` before `}}` (e.g. `{{a{{b}}}}`).
                 if key.contains("{{") {
+                    if out.len().saturating_add(2) > MAX_RESOLVED_BYTES {
+                        return (out, changed, true);
+                    }
                     out.push_str("{{");
                     rest = after_open;
                     continue;
                 }
 
                 if let Some(val) = self.lookup(key) {
+                    if out.len().saturating_add(val.len()) > MAX_RESOLVED_BYTES {
+                        return (out, changed, true);
+                    }
                     out.push_str(&val);
                     changed = true;
                 } else {
+                    let placeholder_len = 4usize.saturating_add(key.len());
+                    if out.len().saturating_add(placeholder_len) > MAX_RESOLVED_BYTES {
+                        return (out, changed, true);
+                    }
                     out.push_str("{{");
                     out.push_str(key);
                     out.push_str("}}");
                 }
                 rest = &after_open[end + 2..];
             } else {
-                out.push_str(&rest[start..]);
-                return (out, changed);
+                let tail = &rest[start..];
+                if out.len().saturating_add(tail.len()) > MAX_RESOLVED_BYTES {
+                    return (out, changed, true);
+                }
+                out.push_str(tail);
+                return (out, changed, false);
             }
         }
 
+        if out.len().saturating_add(rest.len()) > MAX_RESOLVED_BYTES {
+            return (out, changed, true);
+        }
         out.push_str(rest);
-        (out, changed)
+        (out, changed, false)
     }
 }
 
@@ -296,5 +391,33 @@ mod tests {
         let alnum = resolver.resolve("{{$randomAlphaNumeric}}");
         assert_eq!(alnum.len(), 1);
         assert!(alnum.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn exponential_variable_expansion_is_bounded_and_secrets_redacted() {
+        let mut ctx = VariableContext::new();
+        ctx.load_variables(
+            VariableScope::Environment,
+            &[
+                Variable::secret("apiKey", "super_secret_value"),
+                Variable::new("a", "{{b}}{{b}}{{b}}{{b}}{{b}}{{b}}{{b}}{{b}}"),
+                Variable::new("b", "{{c}}{{c}}{{c}}{{c}}{{c}}{{c}}{{c}}{{c}}"),
+                Variable::new("c", "{{d}}{{d}}{{d}}{{d}}{{d}}{{d}}{{d}}{{d}}"),
+                Variable::new("d", "0123456789abcdef0123456789abcdef"),
+            ],
+        );
+
+        let dbg = format!("{ctx:?}");
+        assert!(!dbg.contains("super_secret_value"));
+        assert!(dbg.contains("[REDACTED]"));
+
+        let resolver = VariableResolver::new(ctx);
+        assert_eq!(
+            resolver.resolve_redacted("https://api.test/?k={{apiKey}}"),
+            "https://api.test/?k=[REDACTED]"
+        );
+
+        let expanded = resolver.resolve("{{a}}{{a}}{{a}}{{a}}");
+        assert!(expanded.len() <= MAX_RESOLVED_BYTES);
     }
 }

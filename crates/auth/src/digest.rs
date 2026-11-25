@@ -29,6 +29,14 @@ pub fn apply_digest_challenge(
     let params = parse_digest_challenge(www_authenticate)?;
     let mut merged = cfg.clone();
 
+    for (k, v) in &params {
+        if v.bytes().any(|b| b < 0x20 || b == 0x7f) {
+            return Err(AuthError::InvalidChallenge(format!(
+                "WWW-Authenticate Digest parameter '{k}' contains control characters"
+            )));
+        }
+    }
+
     if let Some(realm) = params.get("realm") {
         merged.realm = realm.clone();
     }
@@ -40,6 +48,13 @@ pub fn apply_digest_challenge(
         ));
     }
     if let Some(alg) = params.get("algorithm") {
+        let configured_sha256 = cfg.algorithm.to_ascii_uppercase().starts_with("SHA-256");
+        let server_md5 = alg.to_ascii_uppercase().starts_with("MD5");
+        if configured_sha256 && server_md5 {
+            return Err(AuthError::InvalidChallenge(
+                "refusing Digest algorithm downgrade from SHA-256 to MD5".into(),
+            ));
+        }
         merged.algorithm = alg.clone();
     }
     if let Some(opaque) = params.get("opaque") {
@@ -51,8 +66,10 @@ pub fn apply_digest_challenge(
             merged.qop = "auth".into();
         } else if options.iter().any(|&o| o.eq_ignore_ascii_case("auth-int")) {
             merged.qop = "auth-int".into();
-        } else if let Some(first) = options.first() {
-            merged.qop = (*first).to_string();
+        } else if !qop_list.trim().is_empty() {
+            return Err(AuthError::InvalidChallenge(format!(
+                "unsupported Digest qop value: {qop_list}"
+            )));
         }
     }
 
@@ -105,6 +122,11 @@ fn build_digest_header(
     }
 
     let qop = cfg.qop.trim().to_ascii_lowercase();
+    if !qop.is_empty() && qop != "auth" && qop != "auth-int" {
+        return Err(AuthError::InvalidConfig(format!(
+            "unsupported Digest qop value: {qop}"
+        )));
+    }
     let ha2 = if qop == "auth-int" {
         let body_hash = hash_fn(&ctx.body);
         hash_fn(format!("{method}:{uri}:{body_hash}").as_bytes())
@@ -217,7 +239,11 @@ fn parse_digest_challenge(header: &str) -> Result<HashMap<String, String>, AuthE
 }
 
 fn escape_quoted(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    s.chars()
+        .filter(|&c| !c.is_control())
+        .collect::<String>()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
 }
 
 fn md5_hex(data: &[u8]) -> String {

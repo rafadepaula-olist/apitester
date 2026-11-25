@@ -568,3 +568,58 @@ fn ntlm_type1_and_type3_handshake() {
     let app3 = apply_ntlm_challenge(&cfg, &format!("NTLM {type2_b64}")).unwrap();
     assert!(app3.headers[0].1.starts_with("NTLM "));
 }
+
+#[test]
+fn security_auth_hardening_checks() {
+    // 1. Empty JWT secret is rejected.
+    let empty_jwt = AuthConfig::Jwt(JwtConfig {
+        secret: String::new(),
+        ..Default::default()
+    });
+    assert!(apply_auth(&empty_jwt, &AuthRequestContext::default()).is_err());
+
+    // 2. OAuth1 PLAINTEXT over http:// is rejected.
+    let oauth1_plain = AuthConfig::OAuth1(OAuth1Config {
+        consumer_key: "ck".into(),
+        consumer_secret: "cs".into(),
+        signature_method: "PLAINTEXT".into(),
+        ..Default::default()
+    });
+    let http_ctx = AuthRequestContext {
+        method: "GET".into(),
+        url: "http://example.com/resource".into(),
+        headers: Vec::new(),
+        body: Vec::new(),
+    };
+    assert!(apply_auth(&oauth1_plain, &http_ctx).is_err());
+
+    // 3. Digest refuses SHA-256 -> MD5 downgrade and invalid qop.
+    let digest_cfg = DigestAuthConfig {
+        username: "u".into(),
+        password: "p".into(),
+        algorithm: "SHA-256".into(),
+        ..Default::default()
+    };
+    assert!(apply_digest_challenge(
+        &digest_cfg,
+        &http_ctx,
+        r#"Digest realm="r", nonce="n", algorithm=MD5, qop="auth""#
+    )
+    .is_err());
+    assert!(apply_digest_challenge(
+        &digest_cfg,
+        &http_ctx,
+        r#"Digest realm="r", nonce="n", algorithm=SHA-256, qop="evil""#
+    )
+    .is_err());
+
+    // 4. OAuth2 rejects non-HTTPS auth_url and verifies state in constant time.
+    let bad_oauth2 = OAuth2Config {
+        auth_url: "file:///etc/passwd".into(),
+        client_id: "cid".into(),
+        ..Default::default()
+    };
+    assert!(build_authorization_url_with_pkce(&bad_oauth2).is_err());
+    assert!(apitester_auth::verify_oauth2_state("abc123", Some("abc123")).is_ok());
+    assert!(apitester_auth::verify_oauth2_state("abc123", Some("wrong")).is_err());
+}

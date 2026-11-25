@@ -56,13 +56,30 @@ pub struct McpClient {
 impl McpClient {
     /// Connects to an MCP server over child-process stdio (newline-delimited JSON-RPC 2.0).
     pub fn connect_stdio(command: &str, args: &[String]) -> NetResult<Self> {
-        let mut child = Command::new(command)
-            .args(args)
+        let mut cmd = Command::new(command);
+        cmd.args(args)
+            .env_clear()
             .kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+        for key in [
+            "PATH",
+            "HOME",
+            "USER",
+            "LANG",
+            "LC_ALL",
+            "TERM",
+            "TMPDIR",
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_DATA_HOME",
+        ] {
+            if let Ok(val) = std::env::var(key) {
+                cmd.env(key, val);
+            }
+        }
+        let mut child = cmd.spawn()?;
 
         let stdin = child
             .stdin

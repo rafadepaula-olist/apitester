@@ -228,6 +228,19 @@ pub struct GrpcUnaryResponse {
     pub timings: ResponseTimings,
 }
 
+fn is_valid_proto_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn is_valid_proto_service(s: &str) -> bool {
+    !s.is_empty() && s.split('.').all(is_valid_proto_ident)
+}
+
 /// Dispatches a unary gRPC call using HTTP/2 gRPC framing (`application/grpc`).
 pub async fn call_unary(req: &GrpcUnaryRequest) -> NetResult<GrpcUnaryResponse> {
     let mut builder = reqwest::Client::builder();
@@ -239,8 +252,15 @@ pub async fn call_unary(req: &GrpcUnaryRequest) -> NetResult<GrpcUnaryResponse> 
     }
     let client = builder.build()?;
 
+    let service = req.service.trim_matches('/');
+    let method = req.method.trim_matches('/');
+    if !is_valid_proto_service(service) || !is_valid_proto_ident(method) {
+        return Err(NetError::Grpc(format!(
+            "invalid gRPC service/method identifier: '{service}/{method}'"
+        )));
+    }
     let base = req.endpoint.trim_end_matches('/');
-    let url = format!("{base}/{}/{}", req.service.trim_matches('/'), req.method.trim_matches('/'));
+    let url = format!("{base}/{service}/{method}");
 
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/grpc"));

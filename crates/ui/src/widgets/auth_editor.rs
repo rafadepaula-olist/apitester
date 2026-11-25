@@ -103,7 +103,7 @@ pub fn auth_editor_ui(ui: &mut Ui, id_salt: &str, auth: &mut AuthConfig) -> bool
         }
         AuthConfig::Bearer { token } => {
             Grid::new(format!("{id_salt}_bearer")).num_columns(2).show(ui, |ui| {
-                changed |= row_text(ui, "Token", token, false);
+                changed |= row_text(ui, "Token", token, true);
             });
         }
         AuthConfig::Basic { username, password } => {
@@ -115,7 +115,7 @@ pub fn auth_editor_ui(ui: &mut Ui, id_salt: &str, auth: &mut AuthConfig) -> bool
         AuthConfig::ApiKey { key, value, add_to } => {
             Grid::new(format!("{id_salt}_apikey")).num_columns(2).show(ui, |ui| {
                 changed |= row_text(ui, "Key", key, false);
-                changed |= row_text(ui, "Value", value, false);
+                changed |= row_text(ui, "Value", value, true);
                 changed |= row_location(ui, &format!("{id_salt}_ak_loc"), "Add to", add_to);
             });
         }
@@ -154,7 +154,7 @@ pub fn auth_editor_ui(ui: &mut Ui, id_salt: &str, auth: &mut AuthConfig) -> bool
                             .changed();
                     });
                 ui.end_row();
-                changed |= row_text(ui, "Access Token", &mut cfg.access_token, false);
+                changed |= row_text(ui, "Access Token", &mut cfg.access_token, true);
                 changed |= row_text(ui, "Header Prefix", &mut cfg.header_prefix, false);
                 changed |= row_text(ui, "Auth URL", &mut cfg.auth_url, false);
                 changed |= row_text(ui, "Token URL", &mut cfg.token_url, false);
@@ -171,7 +171,7 @@ pub fn auth_editor_ui(ui: &mut Ui, id_salt: &str, auth: &mut AuthConfig) -> bool
                 changed |= row_text(ui, "AWS Region", &mut cfg.region, false);
                 changed |= row_text(ui, "Service Name", &mut cfg.service, false);
                 let mut token = cfg.session_token.clone().unwrap_or_default();
-                if row_text(ui, "Session Token", &mut token, false) {
+                if row_text(ui, "Session Token", &mut token, true) {
                     cfg.session_token = if token.is_empty() { None } else { Some(token) };
                     changed = true;
                 }
@@ -204,7 +204,7 @@ pub fn auth_editor_ui(ui: &mut Ui, id_salt: &str, auth: &mut AuthConfig) -> bool
             Grid::new(format!("{id_salt}_oauth1")).num_columns(2).show(ui, |ui| {
                 changed |= row_text(ui, "Consumer Key", &mut cfg.consumer_key, false);
                 changed |= row_text(ui, "Consumer Secret", &mut cfg.consumer_secret, true);
-                changed |= row_text(ui, "Access Token", &mut cfg.token, false);
+                changed |= row_text(ui, "Access Token", &mut cfg.token, true);
                 changed |= row_text(ui, "Token Secret", &mut cfg.token_secret, true);
                 changed |= row_text(ui, "Signature Method", &mut cfg.signature_method, false);
             });
@@ -227,8 +227,8 @@ pub fn auth_editor_ui(ui: &mut Ui, id_salt: &str, auth: &mut AuthConfig) -> bool
         }
         AuthConfig::EdgeGrid(cfg) => {
             Grid::new(format!("{id_salt}_edgegrid")).num_columns(2).show(ui, |ui| {
-                changed |= row_text(ui, "Access Token", &mut cfg.access_token, false);
-                changed |= row_text(ui, "Client Token", &mut cfg.client_token, false);
+                changed |= row_text(ui, "Access Token", &mut cfg.access_token, true);
+                changed |= row_text(ui, "Client Token", &mut cfg.client_token, true);
                 changed |= row_text(ui, "Client Secret", &mut cfg.client_secret, true);
                 changed |= row_text(ui, "Base URL", &mut cfg.base_url, false);
             });

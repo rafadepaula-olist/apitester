@@ -23,7 +23,7 @@ pub use oauth2::{
     AuthorizationRequest, OAuth2CallbackResult, OAuth2TokenResponse, PkceChallenge,
     build_authorization_url_with_pkce, exchange_authorization_code, exchange_client_credentials,
     exchange_password, listen_oauth2_callback, listen_oauth2_callback_on_listener,
-    refresh_access_token,
+    refresh_access_token, verify_oauth2_state,
 };
 
 /// Alias for [`DigestConfig`] matching external caller naming conventions.
@@ -39,10 +39,29 @@ pub struct AuthRequestContext {
 }
 
 /// Headers and query parameters produced by applying an authentication scheme.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct AuthApplication {
     pub headers: Vec<(String, String)>,
     pub query_params: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for AuthApplication {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let headers: Vec<(&str, &str)> = self
+            .headers
+            .iter()
+            .map(|(k, _)| (k.as_str(), "[REDACTED]"))
+            .collect();
+        let query_params: Vec<(&str, &str)> = self
+            .query_params
+            .iter()
+            .map(|(k, _)| (k.as_str(), "[REDACTED]"))
+            .collect();
+        f.debug_struct("AuthApplication")
+            .field("headers", &headers)
+            .field("query_params", &query_params)
+            .finish()
+    }
 }
 
 impl AuthApplication {

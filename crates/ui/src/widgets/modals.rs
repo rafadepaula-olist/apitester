@@ -81,7 +81,12 @@ pub fn render_code_drawer(ctx: &egui::Context, app: &mut ApiTesterApp) {
 
             let maybe_code = app.tabs.get(app.active_tab).and_then(|t| t.as_request()).map(|tab| {
                 let vars = app.build_variable_context(tab.collection_id);
-                generate_code(&tab.request, app.code_drawer_lang, &vars)
+                let effective_vars = if app.reveal_secrets {
+                    vars
+                } else {
+                    vars.redacted_clone()
+                };
+                generate_code(&tab.request, app.code_drawer_lang, &effective_vars)
             });
 
             if let Some(mut code) = maybe_code {
@@ -838,6 +843,35 @@ pub fn import_from_file_path(
     app: &mut ApiTesterApp,
     path: &Path,
 ) -> (ImportFormat, String, String) {
+    const MAX_IMPORT_BYTES: u64 = 25 * 1024 * 1024; // 25 MiB
+    match std::fs::metadata(path) {
+        Ok(meta) if !meta.is_file() => {
+            return (
+                ImportFormat::PostmanCollection,
+                String::new(),
+                format!("Refusing to read non-regular file: {}", path.display()),
+            );
+        }
+        Ok(meta) if meta.len() > MAX_IMPORT_BYTES => {
+            return (
+                ImportFormat::PostmanCollection,
+                String::new(),
+                format!(
+                    "File exceeds 25 MiB import limit: {}",
+                    path.display()
+                ),
+            );
+        }
+        Err(e) => {
+            return (
+                ImportFormat::PostmanCollection,
+                String::new(),
+                format!("Failed to stat {}: {e}", path.display()),
+            );
+        }
+        Ok(_) => {}
+    }
+
     match std::fs::read_to_string(path) {
         Ok(content) => {
             let format = detect_import_format(path, &content);

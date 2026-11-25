@@ -20,7 +20,6 @@ const FLAG_NEGOTIATE_NTLM: u32 = 0x0000_0200;
 const FLAG_NEGOTIATE_ALWAYS_SIGN: u32 = 0x0000_8000;
 const FLAG_NEGOTIATE_EXTENDED_SESSIONSECURITY: u32 = 0x0008_0000;
 const FLAG_NEGOTIATE_128: u32 = 0x2000_0000;
-const FLAG_NEGOTIATE_56: u32 = 0x8000_0000;
 const FLAG_NEGOTIATE_OEM_DOMAIN_SUPPLIED: u32 = 0x0000_1000;
 const FLAG_NEGOTIATE_OEM_WORKSTATION_SUPPLIED: u32 = 0x0000_2000;
 
@@ -65,8 +64,7 @@ pub fn build_type1_negotiate(cfg: &NtlmConfig) -> Result<String, AuthError> {
         | FLAG_NEGOTIATE_NTLM
         | FLAG_NEGOTIATE_ALWAYS_SIGN
         | FLAG_NEGOTIATE_EXTENDED_SESSIONSECURITY
-        | FLAG_NEGOTIATE_128
-        | FLAG_NEGOTIATE_56;
+        | FLAG_NEGOTIATE_128;
 
     if !domain_bytes.is_empty() {
         flags |= FLAG_NEGOTIATE_OEM_DOMAIN_SUPPLIED;
@@ -76,14 +74,18 @@ pub fn build_type1_negotiate(cfg: &NtlmConfig) -> Result<String, AuthError> {
     }
 
     let domain_offset = 32u32;
-    let workstation_offset = domain_offset + domain_bytes.len() as u32;
+    let domain_len_u32 = u32::try_from(domain_bytes.len())
+        .map_err(|_| AuthError::InvalidConfig("NTLM domain too long".into()))?;
+    let workstation_offset = domain_offset
+        .checked_add(domain_len_u32)
+        .ok_or_else(|| AuthError::InvalidConfig("NTLM Type 1 offset overflow".into()))?;
 
     let mut msg = Vec::with_capacity(32 + domain_bytes.len() + workstation_bytes.len());
     msg.extend_from_slice(NTLM_SIGNATURE);
     msg.extend_from_slice(&1u32.to_le_bytes()); // Type 1
     msg.extend_from_slice(&flags.to_le_bytes());
-    write_sec_buf(&mut msg, domain_bytes.len(), domain_offset);
-    write_sec_buf(&mut msg, workstation_bytes.len(), workstation_offset);
+    write_sec_buf(&mut msg, domain_bytes.len(), domain_offset)?;
+    write_sec_buf(&mut msg, workstation_bytes.len(), workstation_offset)?;
     msg.extend_from_slice(domain_bytes);
     msg.extend_from_slice(workstation_bytes);
 
@@ -120,8 +122,12 @@ pub fn build_type3_authenticate(
     let target_info = if type2.len() >= 48 {
         let len = u16::from_le_bytes([type2[40], type2[41]]) as usize;
         let offset = u32::from_le_bytes([type2[44], type2[45], type2[46], type2[47]]) as usize;
-        if len > 0 && offset + len <= type2.len() {
-            type2[offset..offset + len].to_vec()
+        if len > 0 {
+            offset
+                .checked_add(len)
+                .and_then(|end| type2.get(offset..end))
+                .map(|slice| slice.to_vec())
+                .unwrap_or_default()
         } else {
             Vec::new()
         }
@@ -179,32 +185,41 @@ pub fn build_type3_authenticate(
         | FLAG_NEGOTIATE_NTLM
         | FLAG_NEGOTIATE_ALWAYS_SIGN
         | FLAG_NEGOTIATE_EXTENDED_SESSIONSECURITY
-        | FLAG_NEGOTIATE_128
-        | FLAG_NEGOTIATE_56;
+        | FLAG_NEGOTIATE_128;
 
     // Header size for Type 3 is 64 bytes (8 sig + 4 type + 6*8 secbufs + 4 flags).
     let mut offset = 64u32;
     let domain_off = offset;
-    offset += domain_utf16.len() as u32;
+    offset = offset
+        .checked_add(u32::try_from(domain_utf16.len()).map_err(|_| AuthError::InvalidConfig("NTLM domain too long".into()))?)
+        .ok_or_else(|| AuthError::InvalidConfig("NTLM Type 3 offset overflow".into()))?;
     let user_off = offset;
-    offset += user_utf16.len() as u32;
+    offset = offset
+        .checked_add(u32::try_from(user_utf16.len()).map_err(|_| AuthError::InvalidConfig("NTLM username too long".into()))?)
+        .ok_or_else(|| AuthError::InvalidConfig("NTLM Type 3 offset overflow".into()))?;
     let ws_off = offset;
-    offset += workstation_utf16.len() as u32;
+    offset = offset
+        .checked_add(u32::try_from(workstation_utf16.len()).map_err(|_| AuthError::InvalidConfig("NTLM workstation too long".into()))?)
+        .ok_or_else(|| AuthError::InvalidConfig("NTLM Type 3 offset overflow".into()))?;
     let lm_off = offset;
-    offset += lm_response.len() as u32;
+    offset = offset
+        .checked_add(u32::try_from(lm_response.len()).map_err(|_| AuthError::InvalidChallenge("NTLM LM response too large".into()))?)
+        .ok_or_else(|| AuthError::InvalidChallenge("NTLM Type 3 offset overflow".into()))?;
     let nt_off = offset;
-    offset += nt_response.len() as u32;
+    offset = offset
+        .checked_add(u32::try_from(nt_response.len()).map_err(|_| AuthError::InvalidChallenge("NTLM NT response too large".into()))?)
+        .ok_or_else(|| AuthError::InvalidChallenge("NTLM Type 3 offset overflow".into()))?;
     let session_key_off = offset;
 
     let mut msg = Vec::with_capacity(offset as usize);
     msg.extend_from_slice(NTLM_SIGNATURE);
     msg.extend_from_slice(&3u32.to_le_bytes()); // Type 3
-    write_sec_buf(&mut msg, lm_response.len(), lm_off);
-    write_sec_buf(&mut msg, nt_response.len(), nt_off);
-    write_sec_buf(&mut msg, domain_utf16.len(), domain_off);
-    write_sec_buf(&mut msg, user_utf16.len(), user_off);
-    write_sec_buf(&mut msg, workstation_utf16.len(), ws_off);
-    write_sec_buf(&mut msg, 0, session_key_off); // EncryptedRandomSessionKey
+    write_sec_buf(&mut msg, lm_response.len(), lm_off)?;
+    write_sec_buf(&mut msg, nt_response.len(), nt_off)?;
+    write_sec_buf(&mut msg, domain_utf16.len(), domain_off)?;
+    write_sec_buf(&mut msg, user_utf16.len(), user_off)?;
+    write_sec_buf(&mut msg, workstation_utf16.len(), ws_off)?;
+    write_sec_buf(&mut msg, 0, session_key_off)?; // EncryptedRandomSessionKey
     msg.extend_from_slice(&flags.to_le_bytes());
 
     msg.extend_from_slice(&domain_utf16);
@@ -216,11 +231,16 @@ pub fn build_type3_authenticate(
     Ok(STANDARD.encode(msg))
 }
 
-fn write_sec_buf(buf: &mut Vec<u8>, len: usize, offset: u32) {
-    let len16 = len as u16;
+fn write_sec_buf(buf: &mut Vec<u8>, len: usize, offset: u32) -> Result<(), AuthError> {
+    let len16 = u16::try_from(len).map_err(|_| {
+        AuthError::InvalidChallenge(format!(
+            "NTLM security buffer length {len} exceeds u16::MAX"
+        ))
+    })?;
     buf.extend_from_slice(&len16.to_le_bytes());
     buf.extend_from_slice(&len16.to_le_bytes());
     buf.extend_from_slice(&offset.to_le_bytes());
+    Ok(())
 }
 
 fn to_utf16le(s: &str) -> Vec<u8> {

@@ -1,12 +1,13 @@
+use std::fmt;
 use std::time::Duration;
 
-use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
+use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, Transport};
 use tokio::sync::mpsc;
 
 use crate::error::{NetError, NetResult};
 
 /// Connection configuration for an MQTT v3.1.1 broker.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MqttConfig {
     pub host: String,
     pub port: u16,
@@ -15,6 +16,22 @@ pub struct MqttConfig {
     pub password: Option<String>,
     pub keep_alive_secs: u64,
     pub clean_session: bool,
+    pub use_tls: bool,
+}
+
+impl fmt::Debug for MqttConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MqttConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("client_id", &self.client_id)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .field("keep_alive_secs", &self.keep_alive_secs)
+            .field("clean_session", &self.clean_session)
+            .field("use_tls", &self.use_tls)
+            .finish()
+    }
 }
 
 impl Default for MqttConfig {
@@ -27,6 +44,7 @@ impl Default for MqttConfig {
             password: None,
             keep_alive_secs: 30,
             clean_session: true,
+            use_tls: false,
         }
     }
 }
@@ -63,6 +81,9 @@ impl MqttClient {
         opts.set_clean_session(cfg.clean_session);
         if let (Some(u), Some(p)) = (&cfg.username, &cfg.password) {
             opts.set_credentials(u, p);
+        }
+        if cfg.use_tls || cfg.port == 8883 {
+            opts.set_transport(Transport::tls_with_default_config());
         }
 
         let (client, mut eventloop) = AsyncClient::new(opts, 64);

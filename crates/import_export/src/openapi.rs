@@ -17,6 +17,12 @@ const HTTP_METHODS: &[&str] = &[
 
 /// Imports an OpenAPI 3.x or Swagger 2.0 specification (JSON or YAML) into a `Collection`.
 pub fn import_openapi(content: &str) -> ImportExportResult<Collection> {
+    const MAX_OPENAPI_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+    if content.len() > MAX_OPENAPI_BYTES {
+        return Err(ImportExportError::InvalidFormat(format!(
+            "OpenAPI document exceeds {MAX_OPENAPI_BYTES} byte limit"
+        )));
+    }
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return Err(ImportExportError::InvalidFormat(
@@ -27,6 +33,14 @@ pub fn import_openapi(content: &str) -> ImportExportResult<Collection> {
     let doc: Value = if trimmed.starts_with('{') {
         serde_json::from_str(trimmed)?
     } else {
+        // Guard against YAML anchor/alias bomb ("billion laughs") before serde_yaml expands aliases.
+        let alias_count = trimmed.matches('*').count();
+        let anchor_count = trimmed.matches('&').count();
+        if anchor_count > 16 && alias_count > 64 {
+            return Err(ImportExportError::InvalidFormat(
+                "YAML document contains excessive anchors/aliases".into(),
+            ));
+        }
         serde_yaml::from_str(trimmed)?
     };
 
@@ -264,20 +278,38 @@ fn extract_openapi3_base_url(root: &Map<String, Value>) -> String {
         return String::new();
     };
 
-    let mut url = server
-        .get("url")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+    let raw_url = server.get("url").and_then(Value::as_str).unwrap_or("");
+    let Some(vars) = server.get("variables").and_then(Value::as_object) else {
+        return raw_url.to_string();
+    };
 
-    if let Some(vars) = server.get("variables").and_then(Value::as_object) {
-        for (k, v) in vars {
-            if let Some(default_val) = v.get("default").and_then(Value::as_str) {
-                url = url.replace(&format!("{{{k}}}"), default_val);
+    // Single-pass template substitution prevents exponential expansion across chained server vars.
+    let mut out = String::with_capacity(raw_url.len());
+    let mut rest = raw_url;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        if let Some(close) = after.find('}') {
+            let key = &after[..close];
+            if let Some(default_val) = vars
+                .get(key)
+                .and_then(|v| v.get("default"))
+                .and_then(Value::as_str)
+            {
+                out.push_str(default_val);
+            } else {
+                out.push('{');
+                out.push_str(key);
+                out.push('}');
             }
+            rest = &after[close + 1..];
+        } else {
+            out.push_str(&rest[open..]);
+            return out;
         }
     }
-    url
+    out.push_str(rest);
+    out
 }
 
 fn extract_swagger2_base_url(root: &Map<String, Value>) -> String {
@@ -598,58 +630,113 @@ fn schema_to_multipart_fields(doc: &Value, schema: Option<&Value>) -> Vec<FormFi
 }
 
 fn synthesize_schema_example(doc: &Value, schema: &Value, depth: usize) -> Value {
-    if depth > 6 {
+    let mut visited = std::collections::HashSet::new();
+    let mut remaining_nodes = 1_000usize;
+    synthesize_schema_example_bounded(doc, schema, depth, &mut visited, &mut remaining_nodes)
+}
+
+fn synthesize_schema_example_bounded(
+    doc: &Value,
+    schema: &Value,
+    depth: usize,
+    visited: &mut std::collections::HashSet<String>,
+    remaining_nodes: &mut usize,
+) -> Value {
+    if depth > 6 || *remaining_nodes == 0 {
         return Value::Null;
     }
-    let resolved = resolve_ref(doc, schema);
-    if let Some(ex) = resolved.get("example") {
-        return ex.clone();
-    }
-    if let Some(def) = resolved.get("default") {
-        return def.clone();
-    }
-    if let Some(enum_vals) = resolved.get("enum").and_then(Value::as_array) {
-        if let Some(first) = enum_vals.first() {
-            return first.clone();
+    *remaining_nodes -= 1;
+
+    let ref_key = schema
+        .get("$ref")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if let Some(ref key) = ref_key {
+        if !visited.insert(key.clone()) {
+            return Value::Null;
         }
     }
 
-    let ty = resolved.get("type").and_then(Value::as_str).unwrap_or("");
-    match ty {
-        "object" => {
-            let mut map = Map::new();
-            if let Some(props) = resolved.get("properties").and_then(Value::as_object) {
-                for (k, prop) in props {
-                    map.insert(k.clone(), synthesize_schema_example(doc, prop, depth + 1));
-                }
-            }
-            Value::Object(map)
-        }
-        "array" => {
-            if let Some(items) = resolved.get("items") {
-                Value::Array(vec![synthesize_schema_example(doc, items, depth + 1)])
-            } else {
-                Value::Array(Vec::new())
-            }
-        }
-        "integer" => Value::Number(0.into()),
-        "number" => Value::Number(0.into()),
-        "boolean" => Value::Bool(false),
-        "string" => Value::String(String::new()),
-        _ => {
-            if resolved.get("properties").is_some() {
+    let resolved = resolve_ref(doc, schema);
+    let result = if let Some(ex) = resolved.get("example") {
+        ex.clone()
+    } else if let Some(def) = resolved.get("default") {
+        def.clone()
+    } else if let Some(enum_vals) = resolved.get("enum").and_then(Value::as_array) {
+        enum_vals.first().cloned().unwrap_or(Value::Null)
+    } else {
+        let ty = resolved.get("type").and_then(Value::as_str).unwrap_or("");
+        match ty {
+            "object" => {
                 let mut map = Map::new();
                 if let Some(props) = resolved.get("properties").and_then(Value::as_object) {
                     for (k, prop) in props {
-                        map.insert(k.clone(), synthesize_schema_example(doc, prop, depth + 1));
+                        if *remaining_nodes == 0 {
+                            break;
+                        }
+                        map.insert(
+                            k.clone(),
+                            synthesize_schema_example_bounded(
+                                doc,
+                                prop,
+                                depth + 1,
+                                visited,
+                                remaining_nodes,
+                            ),
+                        );
                     }
                 }
                 Value::Object(map)
-            } else {
-                Value::Object(Map::new())
+            }
+            "array" => {
+                if let Some(items) = resolved.get("items") {
+                    Value::Array(vec![synthesize_schema_example_bounded(
+                        doc,
+                        items,
+                        depth + 1,
+                        visited,
+                        remaining_nodes,
+                    )])
+                } else {
+                    Value::Array(Vec::new())
+                }
+            }
+            "integer" => Value::Number(0.into()),
+            "number" => Value::Number(0.into()),
+            "boolean" => Value::Bool(false),
+            "string" => Value::String(String::new()),
+            _ => {
+                if resolved.get("properties").is_some() {
+                    let mut map = Map::new();
+                    if let Some(props) = resolved.get("properties").and_then(Value::as_object) {
+                        for (k, prop) in props {
+                            if *remaining_nodes == 0 {
+                                break;
+                            }
+                            map.insert(
+                                k.clone(),
+                                synthesize_schema_example_bounded(
+                                    doc,
+                                    prop,
+                                    depth + 1,
+                                    visited,
+                                    remaining_nodes,
+                                ),
+                            );
+                        }
+                    }
+                    Value::Object(map)
+                } else {
+                    Value::Object(Map::new())
+                }
             }
         }
+    };
+
+    if let Some(key) = ref_key {
+        visited.remove(&key);
     }
+    result
 }
 
 fn scalar_to_string(val: &Value) -> String {

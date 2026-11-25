@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 
 use crate::error::{CoreError, CoreResult};
@@ -60,9 +62,18 @@ impl VaultStore for KeyringVault {
 }
 
 /// Thread-safe in-memory vault for headless environments and automated tests.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MemoryVault {
     entries: RwLock<HashMap<String, String>>,
+}
+
+impl fmt::Debug for MemoryVault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let count = self.entries.read().map(|g| g.len()).unwrap_or(0);
+        f.debug_struct("MemoryVault")
+            .field("entry_count", &count)
+            .finish()
+    }
 }
 
 impl MemoryVault {
@@ -101,10 +112,21 @@ impl VaultStore for MemoryVault {
 
 /// Vault that attempts the OS keyring first and transparently falls back to `MemoryVault`
 /// when no keyring daemon is available (e.g., headless CI or minimal Linux sessions).
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct HybridVault {
     keyring: KeyringVault,
     fallback: MemoryVault,
+    keyring_used: AtomicBool,
+}
+
+impl fmt::Debug for HybridVault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HybridVault")
+            .field("keyring", &self.keyring)
+            .field("fallback", &self.fallback)
+            .field("keyring_used", &self.keyring_used.load(Ordering::Relaxed))
+            .finish()
+    }
 }
 
 impl HybridVault {
@@ -112,6 +134,7 @@ impl HybridVault {
         Self {
             keyring: KeyringVault::new(service),
             fallback: MemoryVault::new(),
+            keyring_used: AtomicBool::new(false),
         }
     }
 }
@@ -119,7 +142,10 @@ impl HybridVault {
 impl VaultStore for HybridVault {
     fn set_secret(&self, key: &str, value: &str) -> CoreResult<()> {
         match self.keyring.set_secret(key, value) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.keyring_used.store(true, Ordering::Relaxed);
+                Ok(())
+            }
             Err(_) => self.fallback.set_secret(key, value),
         }
     }
@@ -132,8 +158,12 @@ impl VaultStore for HybridVault {
     }
 
     fn delete_secret(&self, key: &str) -> CoreResult<()> {
-        let _ = self.keyring.delete_secret(key);
-        self.fallback.delete_secret(key)
+        let keyring_res = self.keyring.delete_secret(key);
+        let fallback_res = self.fallback.delete_secret(key);
+        if self.keyring_used.load(Ordering::Relaxed) {
+            keyring_res?;
+        }
+        fallback_res
     }
 }
 

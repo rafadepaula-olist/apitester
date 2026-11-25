@@ -240,6 +240,78 @@ pub enum AuthConfig {
     Asap(AsapConfig),
 }
 
+impl AuthConfig {
+    /// Returns a clone of this `AuthConfig` with all secret credential fields blanked out.
+    pub fn redacted(&self) -> Self {
+        match self {
+            Self::Inherit => Self::Inherit,
+            Self::NoAuth => Self::NoAuth,
+            Self::Bearer { .. } => Self::Bearer {
+                token: String::new(),
+            },
+            Self::Basic { username, .. } => Self::Basic {
+                username: username.clone(),
+                password: String::new(),
+            },
+            Self::ApiKey { key, add_to, .. } => Self::ApiKey {
+                key: key.clone(),
+                value: String::new(),
+                add_to: *add_to,
+            },
+            Self::OAuth2(cfg) => {
+                let mut c = cfg.clone();
+                c.access_token.clear();
+                c.refresh_token = None;
+                c.client_secret.clear();
+                Self::OAuth2(c)
+            }
+            Self::AwsV4(cfg) => {
+                let mut c = cfg.clone();
+                c.secret_key.clear();
+                c.session_token = None;
+                Self::AwsV4(c)
+            }
+            Self::Jwt(cfg) => {
+                let mut c = cfg.clone();
+                c.secret.clear();
+                Self::Jwt(c)
+            }
+            Self::Digest(cfg) => {
+                let mut c = cfg.clone();
+                c.password.clear();
+                Self::Digest(c)
+            }
+            Self::OAuth1(cfg) => {
+                let mut c = cfg.clone();
+                c.consumer_secret.clear();
+                c.token_secret.clear();
+                Self::OAuth1(c)
+            }
+            Self::Ntlm(cfg) => {
+                let mut c = cfg.clone();
+                c.password.clear();
+                Self::Ntlm(c)
+            }
+            Self::Hawk(cfg) => {
+                let mut c = cfg.clone();
+                c.auth_key.clear();
+                Self::Hawk(c)
+            }
+            Self::EdgeGrid(cfg) => {
+                let mut c = cfg.clone();
+                c.access_token.clear();
+                c.client_secret.clear();
+                Self::EdgeGrid(c)
+            }
+            Self::Asap(cfg) => {
+                let mut c = cfg.clone();
+                c.private_key.clear();
+                Self::Asap(c)
+            }
+        }
+    }
+}
+
 static NO_AUTH: AuthConfig = AuthConfig::NoAuth;
 
 /// Resolves effective authentication across an inheritance chain ordered from

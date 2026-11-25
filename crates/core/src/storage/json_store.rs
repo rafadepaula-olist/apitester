@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
@@ -16,8 +17,9 @@ impl JsonStore {
     /// Creates a `JsonStore` rooted at `root_dir`, creating `collections/` and `environments/` subdirectories.
     pub fn open(root_dir: impl AsRef<Path>) -> CoreResult<Self> {
         let root_dir = root_dir.as_ref().to_path_buf();
-        fs::create_dir_all(root_dir.join("collections"))?;
-        fs::create_dir_all(root_dir.join("environments"))?;
+        create_private_dir(&root_dir)?;
+        create_private_dir(&root_dir.join("collections"))?;
+        create_private_dir(&root_dir.join("environments"))?;
         Ok(Self { root_dir })
     }
 
@@ -124,10 +126,34 @@ impl JsonStore {
     }
 }
 
+fn create_private_dir(path: &Path) -> CoreResult<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+    }
+    Ok(())
+}
+
 fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> CoreResult<()> {
     let content = serde_json::to_string_pretty(value)?;
-    let tmp_path = path.with_extension("json.tmp");
-    fs::write(&tmp_path, content)?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp_path = parent.join(format!(".apitester-{}.tmp", Uuid::new_v4()));
+
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+
+    let mut file = opts.open(&tmp_path)?;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+
     fs::rename(&tmp_path, path)?;
     Ok(())
 }

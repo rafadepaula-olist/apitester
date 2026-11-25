@@ -86,8 +86,11 @@ pub struct CollectionRunReport {
     pub passed_tests: usize,
     pub failed_tests: usize,
     pub total_duration_ms: f64,
+    #[serde(skip_serializing, default)]
     pub updated_globals: HashMap<String, String>,
+    #[serde(skip_serializing, default)]
     pub updated_collection_vars: HashMap<String, String>,
+    #[serde(skip_serializing, default)]
     pub updated_environment_vars: HashMap<String, String>,
 }
 
@@ -226,12 +229,17 @@ pub async fn run_collection(
                 if script.trim().is_empty() {
                     continue;
                 }
-                let out = run_script(
-                    script,
-                    build_script_input(req, None, &vars),
-                    options.script_timeout_ms,
-                );
-                apply_script_vars(&mut vars, &out);
+                let script_owned = script.to_string();
+                let script_input = build_script_input(req, None, &vars);
+                let timeout_ms = options.script_timeout_ms;
+                let out = tokio::task::spawn_blocking(move || {
+                    run_script(&script_owned, script_input, timeout_ms)
+                })
+                .await
+                .unwrap_or_default();
+                if out.error.is_none() {
+                    apply_script_vars(&mut vars, &out);
+                }
                 all_tests.extend(out.test_results);
                 all_logs.extend(out.console_logs);
                 if out.stop_next_request {
@@ -275,12 +283,18 @@ pub async fn run_collection(
                                     if script.trim().is_empty() {
                                         continue;
                                     }
-                                    let out = run_script(
-                                        script,
-                                        build_script_input(req, Some(resp.clone()), &vars),
-                                        options.script_timeout_ms,
-                                    );
-                                    apply_script_vars(&mut vars, &out);
+                                    let script_owned = script.to_string();
+                                    let script_input =
+                                        build_script_input(req, Some(resp.clone()), &vars);
+                                    let timeout_ms = options.script_timeout_ms;
+                                    let out = tokio::task::spawn_blocking(move || {
+                                        run_script(&script_owned, script_input, timeout_ms)
+                                    })
+                                    .await
+                                    .unwrap_or_default();
+                                    if out.error.is_none() {
+                                        apply_script_vars(&mut vars, &out);
+                                    }
                                     all_tests.extend(out.test_results);
                                     all_logs.extend(out.console_logs);
                                     if out.stop_next_request {
@@ -531,8 +545,14 @@ pub(crate) fn build_auth_context(
             .into_bytes()
         }
         RequestBody::Binary { path } => {
+            const MAX_AUTH_BODY_BYTES: u64 = 100 * 1024 * 1024; // 100 MiB
             let resolved_path = resolver.resolve(path);
-            std::fs::read(resolved_path).unwrap_or_default()
+            match std::fs::metadata(&resolved_path) {
+                Ok(meta) if meta.is_file() && meta.len() <= MAX_AUTH_BODY_BYTES => {
+                    std::fs::read(&resolved_path).unwrap_or_default()
+                }
+                _ => Vec::new(),
+            }
         }
         RequestBody::None | RequestBody::FormData(_) => Vec::new(),
     };

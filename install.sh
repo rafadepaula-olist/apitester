@@ -65,9 +65,9 @@ fi
 BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 echo "Building APITester (release, jobs=$BUILD_JOBS)..."
 if command -v nice >/dev/null 2>&1; then
-    (cd "$BUILD_DIR" && nice -n 10 cargo build --release -j "$BUILD_JOBS" --bin apitester --bin apitester-cli)
+    (cd "$BUILD_DIR" && nice -n 10 cargo build --release --locked -j "$BUILD_JOBS" --bin apitester --bin apitester-cli)
 else
-    (cd "$BUILD_DIR" && cargo build --release -j "$BUILD_JOBS" --bin apitester --bin apitester-cli)
+    (cd "$BUILD_DIR" && cargo build --release --locked -j "$BUILD_JOBS" --bin apitester --bin apitester-cli)
 fi
 
 mkdir -p "$BIN_DIR" "$ICON_DIR" "$APP_DIR"
@@ -76,12 +76,16 @@ install -m 0755 "$BUILD_DIR/target/release/apitester" "$GUI_BIN"
 install -m 0755 "$BUILD_DIR/target/release/apitester-cli" "$CLI_BIN"
 install -m 0644 "$BUILD_DIR/assets/apitester.svg" "$ICON_DEST"
 
+ESCAPED_GUI_BIN="${GUI_BIN//\\/\\\\}"
+ESCAPED_GUI_BIN="${ESCAPED_GUI_BIN//\"/\\\"}"
+ESCAPED_GUI_BIN="${ESCAPED_GUI_BIN//%/%%}"
+
 cat > "$DESKTOP_DEST" <<EOF
 [Desktop Entry]
 Type=Application
 Name=APITester
 Comment=Fast native Rust API client and load tester
-Exec=$GUI_BIN
+Exec="$ESCAPED_GUI_BIN"
 Icon=apitester
 Terminal=false
 Categories=Development;Network;

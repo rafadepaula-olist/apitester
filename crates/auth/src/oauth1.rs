@@ -116,6 +116,12 @@ pub fn apply_oauth1(
         oauth_encode(&cfg.token_secret)
     );
 
+    if sig_method.eq_ignore_ascii_case("PLAINTEXT") && parsed.scheme() != "https" {
+        return Err(AuthError::InvalidConfig(
+            "OAuth1 PLAINTEXT signature method requires an https:// URL".into(),
+        ));
+    }
+
     let signature = compute_signature(sig_method, &signing_key, &base_string)?;
     oauth_params.push(("oauth_signature".into(), signature));
 

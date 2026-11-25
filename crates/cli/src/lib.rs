@@ -547,7 +547,8 @@ fn cmd_codegen(args: CodegenArgs) -> Result<CommandOutput, CliError> {
         ))
     })?;
 
-    let snippet = generate_code(target, args.lang.into(), &vars);
+    let safe_vars = vars.redacted_clone();
+    let snippet = generate_code(target, args.lang.into(), &safe_vars);
     Ok(CommandOutput::ok(snippet))
 }
 

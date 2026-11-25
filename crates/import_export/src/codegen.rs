@@ -266,7 +266,10 @@ fn gen_js_fetch(r: &ResolvedRequest) -> String {
             out.push('\n');
             Some("formData".to_string())
         }
-        RequestBody::Binary { path } => Some(format!("/* binary file: {} */", path)),
+        RequestBody::Binary { path } => {
+            let safe_path = path.replace("*/", "* /").replace(['\r', '\n'], " ");
+            Some(format!("/* binary file: {} */ undefined", safe_path))
+        }
         RequestBody::GraphQL { query, variables } => {
             let payload = graphql_json_payload(query, variables);
             Some(js_str(&payload))
