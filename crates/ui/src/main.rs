@@ -33,6 +33,9 @@ fn main() -> eframe::Result<()> {
         .enable_all()
         .build()
         .expect("failed to start tokio runtime");
+    // Clone handle before run_native so `runtime` stays alive on `main`'s stack
+    // for the entire GUI lifetime instead of being dropped with the AppCreator closure.
+    let rt_handle = runtime.handle().clone();
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -43,9 +46,11 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "APITester",
         native_options,
-        Box::new(move |cc| Ok(Box::new(ApiTesterApp::new(cc, runtime.handle().clone(), config)))),
-    )
+        Box::new(move |cc| Ok(Box::new(ApiTesterApp::new(cc, rt_handle, config)))),
+    );
+    drop(runtime);
+    result
 }

@@ -239,7 +239,7 @@ impl ApiTesterApp {
         let _ = self.sqlite_store.save_settings(&self.settings);
     }
 
-    fn drain_messages(&mut self) {
+    pub fn drain_messages(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 UiMessage::HttpFinished {
@@ -467,7 +467,7 @@ impl ApiTesterApp {
         }
     }
 
-    fn send_active_http_request(&mut self) {
+    pub fn send_active_http_request(&mut self) {
         let Some(tab) = self.tabs.get(self.active_tab) else {
             return;
         };
@@ -479,116 +479,133 @@ impl ApiTesterApp {
             .map(|c| c.auth.clone())
             .unwrap_or(AuthConfig::NoAuth);
 
-        let mut vars = self.build_variable_context(col_id);
+        let vars = self.build_variable_context(col_id);
         let settings = self.settings.clone();
         let cookies = self.cookies.clone();
         let tx = self.tx.clone();
 
         let handle = self.rt.spawn(async move {
-            let mut extra_logs = Vec::new();
-            let mut updated_globals = vars.global.clone();
-            let mut updated_env = vars.environment.clone();
-            let mut updated_col = vars.collection.clone();
+            let tx_panic = tx.clone();
+            let inner = tokio::spawn(async move {
+                let mut vars = vars;
+                let mut extra_logs = Vec::new();
+                let mut updated_globals = vars.global.clone();
+                let mut updated_env = vars.environment.clone();
+                let mut updated_col = vars.collection.clone();
 
-            // 1. Pre-request script
-            if !req.scripts.pre_request.trim().is_empty() {
-                let input = ScriptExecutionInput {
-                    request: req.clone(),
-                    response: None,
-                    globals: updated_globals.clone(),
-                    collection_vars: updated_col.clone(),
-                    environment_vars: updated_env.clone(),
-                    local_vars: vars.local.clone(),
-                    data_vars: vars.data.clone(),
-                };
-                let out = run_script(&req.scripts.pre_request, input, 3_000);
-                extra_logs.extend(out.console_logs);
-                if let Some(err) = out.error {
-                    extra_logs.push(ConsoleLogEntry {
-                        level: ConsoleLogLevel::Error,
-                        message: format!("Pre-request script error: {err}"),
-                        timestamp: Utc::now(),
-                    });
-                }
-                updated_globals = out.updated_globals;
-                updated_col = out.updated_collection_vars;
-                updated_env = out.updated_environment_vars;
-                vars.global = updated_globals.clone();
-                vars.collection = updated_col.clone();
-                vars.environment = updated_env.clone();
-                vars.local = out.updated_local_vars;
-            }
-
-            // 2. Resolve auth inheritance + variable interpolation + apply auth
-            let resolver = VariableResolver::new(vars.clone());
-            let effective_auth = resolve_auth(&[&req.auth, &parent_auth]);
-            let resolved_auth = resolve_auth_variables(effective_auth, &resolver);
-            let auth_ctx = build_auth_context(&req, &resolver);
-
-            let auth_app = match apply_auth(&resolved_auth, &auth_ctx) {
-                Ok(a) => a,
-                Err(e) => {
-                    let _ = tx.send(UiMessage::HttpFinished {
-                        tab_id,
-                        result: Err(format!("Auth error: {e}")),
-                        updated_globals,
-                        updated_env,
-                        updated_collection: (col_id, updated_col),
-                        extra_logs,
-                    });
-                    return;
-                }
-            };
-
-            // 3. Execute HTTP request
-            let opts = HttpRequestOptions {
-                extra_headers: auth_app.headers,
-                extra_query: auth_app.query_params,
-                cookies,
-                settings,
-            };
-
-            let mut http_res = HttpClient::new()
-                .execute(&req, &vars, &opts)
-                .await
-                .map_err(|e| e.to_string());
-
-            // 4. Post-response test script
-            if let Ok(resp) = &mut http_res {
-                if !req.scripts.post_response.trim().is_empty() {
+                // 1. Pre-request script
+                if !req.scripts.pre_request.trim().is_empty() {
                     let input = ScriptExecutionInput {
                         request: req.clone(),
-                        response: Some(resp.clone()),
+                        response: None,
                         globals: updated_globals.clone(),
                         collection_vars: updated_col.clone(),
                         environment_vars: updated_env.clone(),
                         local_vars: vars.local.clone(),
                         data_vars: vars.data.clone(),
                     };
-                    let out = run_script(&req.scripts.post_response, input, 3_000);
-                    resp.test_results.extend(out.test_results);
+                    let out = run_script(&req.scripts.pre_request, input, 3_000);
                     extra_logs.extend(out.console_logs);
                     if let Some(err) = out.error {
                         extra_logs.push(ConsoleLogEntry {
                             level: ConsoleLogLevel::Error,
-                            message: format!("Test script error: {err}"),
+                            message: format!("Pre-request script error: {err}"),
                             timestamp: Utc::now(),
                         });
                     }
                     updated_globals = out.updated_globals;
                     updated_col = out.updated_collection_vars;
                     updated_env = out.updated_environment_vars;
+                    vars.global = updated_globals.clone();
+                    vars.collection = updated_col.clone();
+                    vars.environment = updated_env.clone();
+                    vars.local = out.updated_local_vars;
+                }
+
+                // 2. Resolve auth inheritance + variable interpolation + apply auth
+                let resolver = VariableResolver::new(vars.clone());
+                let effective_auth = resolve_auth(&[&req.auth, &parent_auth]);
+                let resolved_auth = resolve_auth_variables(effective_auth, &resolver);
+                let auth_ctx = build_auth_context(&req, &resolver);
+
+                let auth_app = match apply_auth(&resolved_auth, &auth_ctx) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        let _ = tx.send(UiMessage::HttpFinished {
+                            tab_id,
+                            result: Err(format!("Auth error: {e}")),
+                            updated_globals,
+                            updated_env,
+                            updated_collection: (col_id, updated_col),
+                            extra_logs,
+                        });
+                        return;
+                    }
+                };
+
+                // 3. Execute HTTP request
+                let opts = HttpRequestOptions {
+                    extra_headers: auth_app.headers,
+                    extra_query: auth_app.query_params,
+                    cookies,
+                    settings,
+                };
+
+                let mut http_res = HttpClient::new()
+                    .execute(&req, &vars, &opts)
+                    .await
+                    .map_err(|e| e.to_string());
+
+                // 4. Post-response test script
+                if let Ok(resp) = &mut http_res {
+                    if !req.scripts.post_response.trim().is_empty() {
+                        let input = ScriptExecutionInput {
+                            request: req.clone(),
+                            response: Some(resp.clone()),
+                            globals: updated_globals.clone(),
+                            collection_vars: updated_col.clone(),
+                            environment_vars: updated_env.clone(),
+                            local_vars: vars.local.clone(),
+                            data_vars: vars.data.clone(),
+                        };
+                        let out = run_script(&req.scripts.post_response, input, 3_000);
+                        resp.test_results.extend(out.test_results);
+                        extra_logs.extend(out.console_logs);
+                        if let Some(err) = out.error {
+                            extra_logs.push(ConsoleLogEntry {
+                                level: ConsoleLogLevel::Error,
+                                message: format!("Test script error: {err}"),
+                                timestamp: Utc::now(),
+                            });
+                        }
+                        updated_globals = out.updated_globals;
+                        updated_col = out.updated_collection_vars;
+                        updated_env = out.updated_environment_vars;
+                    }
+                }
+
+                let _ = tx.send(UiMessage::HttpFinished {
+                    tab_id,
+                    result: http_res,
+                    updated_globals,
+                    updated_env,
+                    updated_collection: (col_id, updated_col),
+                    extra_logs,
+                });
+            });
+
+            if let Err(join_err) = inner.await {
+                if !join_err.is_cancelled() {
+                    let _ = tx_panic.send(UiMessage::HttpFinished {
+                        tab_id,
+                        result: Err(format!("Request task failed: {join_err}")),
+                        updated_globals: HashMap::new(),
+                        updated_env: HashMap::new(),
+                        updated_collection: (col_id, HashMap::new()),
+                        extra_logs: Vec::new(),
+                    });
                 }
             }
-
-            let _ = tx.send(UiMessage::HttpFinished {
-                tab_id,
-                result: http_res,
-                updated_globals,
-                updated_env,
-                updated_collection: (col_id, updated_col),
-                extra_logs,
-            });
         });
 
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
@@ -2119,6 +2136,77 @@ mod tests {
         assert_eq!(
             applied.headers,
             vec![("Authorization".to_string(), "Bearer secret_tok_42".to_string())]
+        );
+    }
+
+    #[test]
+    fn send_active_http_request_completes_on_live_server_and_unresolved_url() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempdir().unwrap();
+
+        // Start a local mock HTTP server.
+        let addr = rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf).await;
+                    let body = r#"{"ok":true}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                }
+            });
+            addr
+        });
+
+        let mut app = ApiTesterApp::new_headless(
+            rt.handle().clone(),
+            LaunchConfig {
+                demo_mode: false,
+                data_dir: Some(dir.path().to_path_buf()),
+                screenshot_dir: None,
+            },
+        );
+
+        // 1. Live HTTP 200 test
+        app.tabs[0].request.url = format!("http://{addr}/users/me");
+        app.send_active_http_request();
+        assert!(app.tabs[0].in_flight);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while app.tabs[0].in_flight && std::time::Instant::now() < deadline {
+            app.drain_messages();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        assert!(!app.tabs[0].in_flight, "request stayed in_flight");
+        let resp = app.tabs[0].response.as_ref().expect("expected response");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body_text(), r#"{"ok":true}"#);
+        assert!(!app.console_logs.is_empty());
+
+        // 2. Unresolved variable URL must fail cleanly and clear in_flight
+        app.tabs[0].request.url = "{{url}}/users/me".to_string();
+        app.send_active_http_request();
+        assert!(app.tabs[0].in_flight);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while app.tabs[0].in_flight && std::time::Instant::now() < deadline {
+            app.drain_messages();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        assert!(!app.tabs[0].in_flight, "unresolved URL stayed in_flight");
+        assert!(
+            app.tabs[0].last_error.is_some(),
+            "expected invalid URL error"
         );
     }
 }
