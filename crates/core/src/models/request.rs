@@ -162,7 +162,7 @@ pub enum RawLanguage {
 
 /// Request payload configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
+#[serde(tag = "mode", content = "data", rename_all = "snake_case")]
 pub enum RequestBody {
     #[default]
     None,
@@ -338,5 +338,103 @@ mod tests {
         let json = serde_json::to_string(&req).expect("serialize");
         let back: RequestItem = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, req);
+    }
+
+    #[test]
+    fn exhaustive_request_body_protocol_and_collection_json_store_round_trip() {
+        use crate::models::{Collection, CollectionNode, Folder};
+        use crate::storage::JsonStore;
+
+        let bodies = vec![
+            RequestBody::None,
+            RequestBody::Raw {
+                content: r#"{"hello":"world"}"#.into(),
+                language: RawLanguage::Json,
+            },
+            RequestBody::UrlEncoded(vec![
+                KeyValue::new("grant_type", "client_credentials"),
+                KeyValue::new("scope", "read"),
+            ]),
+            RequestBody::FormData(vec![
+                FormField::text("title", "Report"),
+                FormField::file("attachment", "/tmp/report.pdf"),
+            ]),
+            RequestBody::Binary {
+                path: "/tmp/payload.bin".into(),
+            },
+            RequestBody::GraphQL {
+                query: "query { me { id } }".into(),
+                variables: r#"{"id":1}"#.into(),
+            },
+        ];
+
+        for body in &bodies {
+            let json = serde_json::to_string_pretty(body).expect("serialize RequestBody");
+            let back: RequestBody = serde_json::from_str(&json).expect("deserialize RequestBody");
+            assert_eq!(&back, body);
+        }
+
+        let protocols = vec![
+            ProtocolConfig::Http,
+            ProtocolConfig::GraphQL {
+                schema_url: Some("https://api.test/gql".into()),
+            },
+            ProtocolConfig::WebSocket {
+                subprotocols: vec!["json".into()],
+            },
+            ProtocolConfig::Grpc {
+                proto_path: Some("service.proto".into()),
+                service: "acme.Greeter".into(),
+                method: "SayHello".into(),
+                use_reflection: false,
+            },
+            ProtocolConfig::Mqtt {
+                topic: "sensors/#".into(),
+                qos: 1,
+                client_id: "c1".into(),
+            },
+            ProtocolConfig::SocketIo {
+                namespace: "/chat".into(),
+                event: "msg".into(),
+                version: "4".into(),
+            },
+            ProtocolConfig::Mcp {
+                transport: "http".into(),
+                command: None,
+                args: Vec::new(),
+            },
+            ProtocolConfig::Sse {
+                last_event_id: Some("42".into()),
+            },
+        ];
+
+        for proto in &protocols {
+            let json = serde_json::to_string_pretty(proto).expect("serialize ProtocolConfig");
+            let back: ProtocolConfig =
+                serde_json::from_str(&json).expect("deserialize ProtocolConfig");
+            assert_eq!(&back, proto);
+        }
+
+        // Save and reload a collection containing all body modes & protocols via JsonStore.
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonStore::open(dir.path()).unwrap();
+        let mut col = Collection::new("Exhaustive Collection");
+        let mut folder = Folder::new("All Bodies");
+        for (i, body) in bodies.into_iter().enumerate() {
+            let mut req = RequestItem::new(
+                format!("Req {i}"),
+                HttpMethod::Post,
+                "https://api.example.com/test",
+            );
+            req.body = body;
+            req.protocol = protocols[i % protocols.len()].clone();
+            folder.items.push(CollectionNode::Request(req));
+        }
+        col.items.push(CollectionNode::Folder(folder));
+
+        store.save_collection(&col).expect("save_collection");
+        let loaded = store.list_collections().expect("list_collections");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0], col);
     }
 }
