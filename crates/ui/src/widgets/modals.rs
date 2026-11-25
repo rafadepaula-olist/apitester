@@ -42,6 +42,7 @@ pub fn render_modals(ctx: &egui::Context, app: &mut ApiTesterApp) {
         ModalState::None => {}
         ModalState::ImportExport {
             mut format,
+            mut file_path,
             mut input_text,
             mut status,
         } => {
@@ -56,6 +57,7 @@ pub fn render_modals(ctx: &egui::Context, app: &mut ApiTesterApp) {
             if let Some(path) = dropped_paths.first() {
                 let (detected, text, msg) = import_from_file_path(app, path);
                 format = detected;
+                file_path = path.display().to_string();
                 input_text = text;
                 status = msg;
             }
@@ -82,15 +84,14 @@ pub fn render_modals(ctx: &egui::Context, app: &mut ApiTesterApp) {
                             )
                             .clicked()
                         {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("API Files", &["json", "yaml", "yml", "har", "txt"])
-                                .pick_file()
-                            {
-                                let (detected, text, msg) = import_from_file_path(app, &path);
-                                format = detected;
-                                input_text = text;
-                                status = msg;
-                            }
+                            status = "Opening file dialog...".into();
+                            let tx = app.tx.clone();
+                            let egui_ctx = ctx.clone();
+                            app.rt.spawn(async move {
+                                let picked = pick_import_file_async().await;
+                                let _ = tx.send(UiMessage::ImportFilePicked(picked));
+                                egui_ctx.request_repaint();
+                            });
                         }
                         if ui
                             .add_enabled(
@@ -111,9 +112,30 @@ pub fn render_modals(ctx: &egui::Context, app: &mut ApiTesterApp) {
                             .clicked()
                         {
                             input_text.clear();
+                            file_path.clear();
                             status.clear();
                         }
                         ui.weak("or drag & drop a file here");
+                    });
+
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label("File path:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut file_path)
+                                .hint_text("/path/to/collection.postman_collection.json")
+                                .desired_width((ui.available_width() - 70.0).max(200.0)),
+                        );
+                        if ui
+                            .add_enabled(!file_path.trim().is_empty(), egui::Button::new("Load"))
+                            .clicked()
+                        {
+                            let p = Path::new(file_path.trim()).to_path_buf();
+                            let (detected, text, msg) = import_from_file_path(app, &p);
+                            format = detected;
+                            input_text = text;
+                            status = msg;
+                        }
                     });
 
                     ui.add_space(4.0);
@@ -137,11 +159,11 @@ pub fn render_modals(ctx: &egui::Context, app: &mut ApiTesterApp) {
                     ui.add_space(4.0);
                     ScrollArea::vertical()
                         .id_salt("import_export_text_scroll")
-                        .max_height(240.0)
+                        .max_height(220.0)
                         .show(ui, |ui| {
                             ui.add(
                                 egui::TextEdit::multiline(&mut input_text)
-                                    .desired_rows(12)
+                                    .desired_rows(11)
                                     .desired_width(f32::INFINITY)
                                     .hint_text("Paste Postman v2.1 JSON, cURL command, OpenAPI JSON/YAML, or HAR 1.2 JSON...")
                                     .code_editor(),
@@ -193,19 +215,21 @@ pub fn render_modals(ctx: &egui::Context, app: &mut ApiTesterApp) {
                             .clicked()
                         {
                             let default_name = match format {
-                                ImportFormat::PostmanEnvironment => "environment.postman_environment.json",
+                                ImportFormat::PostmanEnvironment => {
+                                    "environment.postman_environment.json"
+                                }
                                 ImportFormat::Curl => "request.sh",
                                 _ => "collection.postman_collection.json",
                             };
-                            if let Some(path) = rfd::FileDialog::new()
-                                .set_file_name(default_name)
-                                .save_file()
-                            {
-                                status = match std::fs::write(&path, &input_text) {
-                                    Ok(()) => format!("Saved to {}", path.display()),
-                                    Err(e) => format!("Save failed: {e}"),
-                                };
-                            }
+                            let content_to_save = input_text.clone();
+                            let tx = app.tx.clone();
+                            let egui_ctx = ctx.clone();
+                            status = "Opening save dialog...".into();
+                            app.rt.spawn(async move {
+                                let res = save_export_file_async(default_name, content_to_save).await;
+                                let _ = tx.send(UiMessage::ExportFileSaved(res));
+                                egui_ctx.request_repaint();
+                            });
                         }
                     });
 
@@ -217,6 +241,7 @@ pub fn render_modals(ctx: &egui::Context, app: &mut ApiTesterApp) {
             app.modal = if open {
                 ModalState::ImportExport {
                     format,
+                    file_path,
                     input_text,
                     status,
                 }
@@ -525,6 +550,81 @@ pub fn render_modals(ctx: &egui::Context, app: &mut ApiTesterApp) {
                 app.modal = ModalState::None;
             }
         }
+    }
+}
+
+/// Opens a non-blocking async file picker inside the Tokio runtime (with `zenity` fallback if portal fails).
+async fn pick_import_file_async() -> Result<Option<std::path::PathBuf>, String> {
+    let portal_res = tokio::spawn(async {
+        rfd::AsyncFileDialog::new()
+            .add_filter("API Files", &["json", "yaml", "yml", "har", "txt"])
+            .pick_file()
+            .await
+            .map(|h| h.path().to_path_buf())
+    })
+    .await;
+
+    match portal_res {
+        Ok(path) => Ok(path),
+        Err(_) => pick_file_via_zenity(false, None).await,
+    }
+}
+
+/// Opens a non-blocking async save dialog inside the Tokio runtime and writes `content` to disk.
+async fn save_export_file_async(
+    default_name: &str,
+    content: String,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let name_owned = default_name.to_string();
+    let portal_res = tokio::spawn(async move {
+        rfd::AsyncFileDialog::new()
+            .set_file_name(&name_owned)
+            .save_file()
+            .await
+            .map(|h| h.path().to_path_buf())
+    })
+    .await;
+
+    let chosen = match portal_res {
+        Ok(path) => path,
+        Err(_) => pick_file_via_zenity(true, Some(default_name)).await?,
+    };
+
+    if let Some(path) = chosen {
+        tokio::fs::write(&path, content)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Some(path))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn pick_file_via_zenity(
+    save: bool,
+    default_name: Option<&str>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let mut cmd = tokio::process::Command::new("zenity");
+    cmd.arg("--file-selection");
+    if save {
+        cmd.arg("--save").arg("--confirm-overwrite");
+        if let Some(name) = default_name {
+            cmd.arg(format!("--filename={name}"));
+        }
+    }
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| format!("desktop portal and zenity unavailable ({e}); use the File path field instead"))?;
+    if output.status.success() {
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if s.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(std::path::PathBuf::from(s)))
+        }
+    } else {
+        Ok(None)
     }
 }
 

@@ -411,6 +411,37 @@ impl ApiTesterApp {
                     self.load_timeline = summary.timeline.clone();
                     self.load_summary = Some(summary);
                 }
+                UiMessage::ImportFilePicked(res) => match res {
+                    Ok(Some(path)) => {
+                        let (detected, text, msg) =
+                            crate::widgets::modals::import_from_file_path(self, &path);
+                        self.modal = ModalState::ImportExport {
+                            format: detected,
+                            file_path: path.display().to_string(),
+                            input_text: text,
+                            status: msg,
+                        };
+                    }
+                    Ok(None) => {
+                        if let ModalState::ImportExport { status, .. } = &mut self.modal {
+                            *status = "File selection cancelled.".into();
+                        }
+                    }
+                    Err(err) => {
+                        if let ModalState::ImportExport { status, .. } = &mut self.modal {
+                            *status = format!("File dialog error: {err}");
+                        }
+                    }
+                },
+                UiMessage::ExportFileSaved(res) => {
+                    if let ModalState::ImportExport { status, .. } = &mut self.modal {
+                        *status = match res {
+                            Ok(Some(path)) => format!("Saved to {}", path.display()),
+                            Ok(None) => "Save cancelled.".into(),
+                            Err(err) => format!("Save failed: {err}"),
+                        };
+                    }
+                }
             }
         }
     }
@@ -674,6 +705,7 @@ impl ApiTesterApp {
                 if ui.button("Import/Export").clicked() {
                     self.modal = ModalState::ImportExport {
                         format: ImportFormat::PostmanCollection,
+                        file_path: String::new(),
                         input_text: String::new(),
                         status: String::new(),
                     };

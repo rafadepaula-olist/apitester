@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use apitester_core::models::{
     ConsoleLogEntry, HttpMethod, ProtocolConfig, RequestItem, ResponseData,
@@ -75,6 +76,7 @@ pub enum ModalState {
     None,
     ImportExport {
         format: ImportFormat,
+        file_path: String,
         input_text: String,
         status: String,
     },
@@ -334,4 +336,6 @@ pub enum UiMessage {
     RunnerFinished(CollectionRunReport),
     LoadProgress(LoadProgressUpdate),
     LoadFinished(LoadTestSummary),
+    ImportFilePicked(Result<Option<PathBuf>, String>),
+    ExportFileSaved(Result<Option<PathBuf>, String>),
 }

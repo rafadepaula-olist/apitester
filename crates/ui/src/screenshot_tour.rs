@@ -201,6 +201,7 @@ fn configure_step(app: &mut ApiTesterApp, step: usize) {
                 .unwrap_or_default();
             app.modal = ModalState::ImportExport {
                 format: ImportFormat::PostmanCollection,
+                file_path: String::new(),
                 input_text: large_json,
                 status: "Ready to import (choose a file, drop one here, or click Import).".into(),
             };
